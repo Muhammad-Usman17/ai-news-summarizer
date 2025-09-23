@@ -1,0 +1,19 @@
+system.advancedVisibilityConfigExist:
+  - value: true
+    constraints: {}
+
+system.enableReadFromClosedExecutionV2:
+  - value: true
+    constraints: {}
+
+limit.maxIDLength:
+  - value: 1000
+    constraints: {}
+
+history.maxAutoResetPoints:
+  - value: 20
+    constraints: {}
+
+system.advancedVisibilityWritingMode:
+  - value: "dual"
+    constraints: {}

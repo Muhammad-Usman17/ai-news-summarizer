@@ -1,0 +1,144 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: news_postgres
+    environment:
+      POSTGRES_DB: newsdb
+      POSTGRES_USER: newsuser
+      POSTGRES_PASSWORD: newspassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U newsuser -d newsdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache & Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: news_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # RabbitMQ for Celery (Alternative to Redis)
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: news_rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: newsuser
+      RABBITMQ_DEFAULT_PASS: newspassword
+    ports:
+      - "5672:5672"
+      - "15672:15672"  # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Temporal Server
+  temporal:
+    image: temporalio/auto-setup:1.21.5
+    container_name: news_temporal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=newsuser
+      - POSTGRES_PWD=newspassword
+      - POSTGRES_SEEDS=postgres
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+    ports:
+      - "7233:7233"
+    volumes:
+      - ./docker/temporal:/etc/temporal/config/dynamicconfig
+
+  # Temporal Web UI
+  temporal-web:
+    image: temporalio/ui:2.21.3
+    container_name: news_temporal_web
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    ports:
+      - "8080:8080"
+
+# LLM service replaced with Groq API (cloud-based, no local container needed)
+
+  # Jaeger for Tracing
+  jaeger:
+    image: jaegertracing/all-in-one:1.50
+    container_name: news_jaeger
+    ports:
+      - "16686:16686"  # UI
+      - "14268:14268"  # HTTP collector
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+  # Prometheus for Metrics
+  prometheus:
+    image: prom/prometheus:v2.47.2
+    container_name: news_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+
+  # Grafana for Visualization
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: news_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana:/etc/grafana/provisioning
+
+  # Loki for Logging
+  loki:
+    image: grafana/loki:2.9.2
+    container_name: news_loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki.yml:/etc/loki/local-config.yaml
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+
+networks:
+  default:
+    name: news-network
