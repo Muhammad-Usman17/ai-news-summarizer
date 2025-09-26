@@ -216,3 +216,7 @@ class RedisStreamService:
             await self.redis_client.aclose()
             self.redis_client = None
             logger.info("Redis client closed")
+
+
+# Global service instance
+redis_stream_service = RedisStreamService()

@@ -1,5 +1,16 @@
 import axios from 'axios';
-import { NewsJob, NewsJobResult, TimelineItem } from './types';
+import { 
+  NewsJob, 
+  NewsJobResult, 
+  TimelineItem, 
+  ProcessingStats,
+  WorkflowHealthStatus,
+  StaleJobSyncResult,
+  HourlyProcessingStatus,
+  NewsScheduleStatus,
+  ScheduleConfig,
+  ScheduleControlResult
+} from './types';
 
 const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:8000';
 
@@ -11,20 +22,73 @@ const api = axios.create({
 });
 
 export const newsAPI = {
-  // Trigger news workflow
-  async triggerNewsWorkflow(): Promise<{ job_id: string; status: string; message: string }> {
+  // MANUAL WORKFLOW TRIGGERS (No date selection - current date only)
+  // Trigger manual news workflow for current date
+  async triggerNewsWorkflow(): Promise<{ job_id: string; status: string; job_type: string; message: string; target_date: string }> {
     const response = await api.post('/news/run');
     return response.data;
   },
 
-  // Trigger multi-agent workflow
-  async triggerMultiAgentWorkflow(date?: string): Promise<{ job_id: string; status: string; message: string; target_date: string }> {
-    const response = await api.post('/news/multi-agent', {}, {
-      params: date ? { target_date: date } : {}
-    });
+  // Historical functionality now handled by timeline API with optional date parameter
+
+  // Get processing statistics
+  async getProcessingStats(days: number = 30): Promise<ProcessingStats> {
+    const response = await api.get(`/news/processing/stats?days=${days}`);
     return response.data;
   },
 
+  // HOURLY PROCESSING CONTROL (LEGACY - Use schedule endpoints instead)
+  // Start hourly automated processing
+  async startHourlyProcessing(): Promise<{ status: string; message: string; schedule: string; next_run: string }> {
+    const response = await api.post('/news/hourly/start');
+    return response.data;
+  },
+
+  // Get hourly processing status
+  async getHourlyProcessingStatus(): Promise<HourlyProcessingStatus> {
+    const response = await api.get('/news/hourly/status');
+    return response.data;
+  },
+
+  // SCHEDULE CONTROL (NEW - Configurable cron jobs)
+  // Start news processing schedule
+  async startNewsSchedule(config: ScheduleConfig): Promise<ScheduleControlResult> {
+    const response = await api.post('/news/schedule/start', config);
+    return response.data;
+  },
+
+  // Stop news processing schedule
+  async stopNewsSchedule(): Promise<ScheduleControlResult> {
+    const response = await api.post('/news/schedule/stop');
+    return response.data;
+  },
+
+  // Get news processing schedule status
+  async getNewsScheduleStatus(): Promise<NewsScheduleStatus> {
+    const response = await api.get('/news/schedule/status');
+    return response.data;
+  },
+
+  // WORKFLOW STATUS SYNC
+  // Sync stale workflows
+  async syncStaleWorkflows(maxAgeHours: number = 2): Promise<StaleJobSyncResult> {
+    const response = await api.post(`/news/workflow/sync-stale?max_age_hours=${maxAgeHours}`);
+    return response.data;
+  },
+
+  // Get workflow health status
+  async getWorkflowHealth(): Promise<WorkflowHealthStatus> {
+    const response = await api.get('/news/workflow/health');
+    return response.data;
+  },
+
+  // Terminate a workflow
+  async terminateWorkflow(jobId: string, reason: string = 'Manual termination'): Promise<{ success: boolean; job_id: string; message: string }> {
+    const response = await api.post(`/news/workflow/terminate/${jobId}?reason=${encodeURIComponent(reason)}`);
+    return response.data;
+  },
+
+  // EXISTING JOB MANAGEMENT
   // Get job status
   async getJobStatus(jobId: string): Promise<NewsJob> {
     const response = await api.get(`/news/jobs/${jobId}`);
@@ -43,6 +107,7 @@ export const newsAPI = {
     return response.data;
   },
 
+  // SYSTEM HEALTH
   // Health check
   async healthCheck(): Promise<{ status: string; timestamp: string; service: string }> {
     const response = await api.get('/health');
@@ -55,37 +120,20 @@ export const newsAPI = {
     return response.data;
   },
 
-  // Get daily news for a specific date using new timeline endpoint
-  async getDailyNews(date: string): Promise<{
-    date: string;
+  // TIMELINE AND DATA ACCESS
+  // Get news timeline with optional date filtering
+  async getNewsTimeline(limit: number = 20, offset: number = 0, date?: string): Promise<{
     items: any[];
+    total: number;
     overall_summary?: any;
-    total: number;
-    date_filter: string;
+    date_filter?: string;
   }> {
-    const response = await api.get('/news/timeline', {
-      params: {
-        date: date,
-        limit: 50
-      }
-    });
-    return {
-      date,
-      items: response.data.items,
-      overall_summary: response.data.overall_summary,
-      total: response.data.total,
-      date_filter: response.data.date_filter
-    };
-  },
-
-  // Get news timeline (all recent news)
-  async getNewsTimeline(limit: number = 20, offset: number = 0): Promise<{
-    items: any[];
-    total: number;
-  }> {
-    const response = await api.get('/news/timeline', {
-      params: { limit, offset }
-    });
+    const params: any = { limit, offset };
+    if (date) {
+      params.date = date;
+    }
+    
+    const response = await api.get('/news/timeline', { params });
     return response.data;
   },
 
@@ -113,6 +161,7 @@ export const newsAPI = {
     return response.data;
   },
 
+  // DATA SYNC
   // Sync data with database
   async syncData(): Promise<{
     sync_timestamp: string;
@@ -124,14 +173,14 @@ export const newsAPI = {
     return response.data;
   },
 
-  // Trigger news workflow with optional date
+  // LEGACY SUPPORT (DEPRECATED - Use historical endpoints instead)
+  // Trigger news workflow with optional date (DEPRECATED)
   async triggerNewsWorkflowWithDate(date?: string): Promise<{ job_id: string; status: string; message: string; target_date: string }> {
-    const response = await api.post('/news/run', {}, {
-      params: date ? { target_date: date } : {}
-    });
-    return response.data;
+    console.warn('triggerNewsWorkflowWithDate is deprecated. Use getHistoricalNews for older dates or triggerNewsWorkflow for current date.');
+    return this.triggerNewsWorkflow();
   },
 
+  // UTILITY FUNCTIONS
   // Convert job result to timeline items
   convertToTimelineItems(jobResult: NewsJobResult): TimelineItem[] {
     const items: TimelineItem[] = [];
@@ -144,10 +193,10 @@ export const newsAPI = {
         timestamp: summary.created_at,
         title: summary.article?.title || 'News Summary',
         content: summary.summary,
+        bullet_points: summary.bullet_points,
         metadata: {
           source: summary.article?.source,
           sentiment: summary.sentiment,
-          key_points: summary.key_points,
         },
       });
     });
@@ -160,6 +209,8 @@ export const newsAPI = {
         timestamp: analysis.created_at,
         title: 'News Analysis',
         content: analysis.analysis,
+        insights: analysis.insights,
+        impact_assessment: analysis.impact_assessment,
         metadata: {
           tags: analysis.tags,
         },
@@ -169,4 +220,12 @@ export const newsAPI = {
     // Sort by timestamp (newest first)
     return items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
   },
-};
+
+  // Format date for API calls
+  formatDateForAPI(date: Date): string {
+    return date.toISOString().split('T')[0]; // Returns YYYY-MM-DD format
+  },
+
+  };
+
+export default newsAPI;

@@ -2,7 +2,6 @@ from datetime import timedelta
 from temporalio import workflow, activity
 from temporalio.common import RetryPolicy
 from typing import List, Dict, Any
-import asyncio
 
 
 @workflow.defn
@@ -54,11 +53,24 @@ class NewsWorkflow:
                 )
             )
             
-            # Step 3: Analyze summaries
+            # Step 3: Critique and improve summaries
+            workflow.logger.info("Starting critique step")
+            critique_result = await workflow.execute_activity(
+                critique_summaries,
+                args=[job_id, summary_result["summaries"]],
+                start_to_close_timeout=timedelta(minutes=12),  # Slightly longer for review process
+                retry_policy=RetryPolicy(
+                    initial_interval=timedelta(seconds=2),
+                    maximum_interval=timedelta(seconds=60),
+                    maximum_attempts=2  # Fewer retries since this is optional improvement
+                )
+            )
+            
+            # Step 4: Analyze improved summaries
             workflow.logger.info("Starting analysis step")
             analysis_result = await workflow.execute_activity(
                 analyze_news,
-                args=[job_id, summary_result["summaries"]],
+                args=[job_id, critique_result["improved_summaries"]],
                 start_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(
                     initial_interval=timedelta(seconds=2),
@@ -67,21 +79,24 @@ class NewsWorkflow:
                 )
             )
             
-            # Step 4: Mark job as completed in database
+            # Step 5: Mark job as completed in database
             await workflow.execute_activity(
                 mark_job_completed,
                 args=[job_id],
                 start_to_close_timeout=timedelta(minutes=2)
             )
             
-            # Step 5: Return final result
+            # Step 6: Return final result
             final_result = {
                 "job_id": job_id,
                 "status": "completed",
                 "articles": scraper_result["articles"],
                 "summaries": summary_result["summaries"],
+                "improved_summaries": critique_result["improved_summaries"],
+                "critiques": critique_result["critiques"],
                 "analyses": analysis_result["analyses"],
                 "processing_time": analysis_result.get("total_processing_time", 0),
+                "critique_processing_time": critique_result.get("total_processing_time", 0),
                 "completed_at": workflow.now().isoformat()
             }
             
@@ -106,33 +121,6 @@ class NewsWorkflow:
             }
 
 
-@workflow.defn
-class DailyNewsWorkflow:
-    """
-    Daily scheduled workflow for automatic news summarization.
-    """
-    
-    @workflow.run
-    async def run(self) -> Dict[str, Any]:
-        """
-        Run the daily news workflow.
-        """
-        import uuid
-        job_id = f"daily_{workflow.now().strftime('%Y%m%d')}_{str(uuid.uuid4())[:8]}"
-        
-        workflow.logger.info(f"Starting daily news workflow for job {job_id}")
-        
-        # Execute the main news workflow
-        result = await workflow.execute_child_workflow(
-            NewsWorkflow.run,
-            args=[job_id],
-            id=f"news_workflow_{job_id}"
-        )
-        
-        workflow.logger.info(f"Daily news workflow completed, status={result.get('status')}")
-        return result
-
-
 # Activity functions
 @activity.defn
 async def scrape_news(job_id: str, target_date: str = None) -> Dict[str, Any]:
@@ -152,6 +140,17 @@ async def summarize_news(job_id: str, articles: List[Dict[str, Any]]) -> Dict[st
     
     agent = SummarizerAgent(job_id)
     result = await agent.run(articles)
+    
+    return result
+
+
+@activity.defn
+async def critique_summaries(job_id: str, summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Review and improve summaries using quality critique."""
+    from app.agents.critic_agent import CriticAgent
+    
+    agent = CriticAgent(job_id)
+    result = await agent.run(summaries)
     
     return result
 

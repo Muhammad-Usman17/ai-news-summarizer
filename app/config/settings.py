@@ -19,15 +19,28 @@ class Settings(BaseSettings):
     celery_broker_url: str = "redis://localhost:6379/1"
     celery_result_backend: str = "redis://localhost:6379/2"
     
-    # Temporal
+    # Scheduling - Enhanced configuration
+    news_processing_schedule_hours: int = 1  # Run every X hours
+    news_processing_enabled: bool = True
+    news_processing_schedule_type: str = "hourly"  # "hourly", "daily", "custom"
+    news_processing_custom_cron: str = "0 */1 * * *"  # Custom cron expression
+    news_processing_daily_time: int = 9  # Hour for daily processing (24-hour format)
+    
+    # Temporal (keeping for migration compatibility)
     temporal_host: str = "localhost:7233"
     
     # LLM Services
     groq_api_key: str = os.getenv("GROQ_API_KEY", "")
     groq_model: str = "llama3-8b-8192"  # Fast model for summarization
     
-    # News Sources
-    rss_feeds: str = "https://feeds.bbci.co.uk/news/rss.xml,https://techcrunch.com/feed/"
+    # News Sources - Updated with reliable RSS feeds
+    rss_feeds: str = os.getenv("RSS_FEEDS", 
+        "https://feeds.bbci.co.uk/news/technology/rss.xml,"
+        "https://feeds.arstechnica.com/arstechnica/index,"
+        "https://rss.slashdot.org/Slashdot/slashdot,"
+        "https://feeds.feedburner.com/TechCrunch,"
+        "https://www.wired.com/feed/rss"
+    )
     
     # Observability
     jaeger_endpoint: str = "http://localhost:14268/api/traces"

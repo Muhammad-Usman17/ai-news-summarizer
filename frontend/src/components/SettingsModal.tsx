@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { X, Play, RotateCw, Users, Activity, AlertCircle, CheckCircle } from 'lucide-react';
+import { X, Play, RotateCw, Activity, AlertCircle, CheckCircle, Clock, Settings } from 'lucide-react';
 import { newsAPI } from '../api';
-import { NewsJob } from '../types';
+import { NewsJob, NewsScheduleStatus, ScheduleConfig } from '../types';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -11,10 +11,18 @@ interface SettingsModalProps {
 export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
   const [jobs, setJobs] = useState<NewsJob[]>([]);
   const [healthStatus, setHealthStatus] = useState<any>(null);
+  const [scheduleStatus, setScheduleStatus] = useState<NewsScheduleStatus | null>(null);
   const [loading, setLoading] = useState(false);
+  const [scheduleLoading, setScheduleLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
-
+  
+  // Schedule form state
+  const [scheduleConfig, setScheduleConfig] = useState<ScheduleConfig>({
+    schedule_type: 'hourly',
+    hours: 1,
+    daily_time: 9,
+    custom_cron: '0 */1 * * *'
+  });
   useEffect(() => {
     if (isOpen) {
       fetchData();
@@ -25,12 +33,24 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
     setLoading(true);
     setError(null);
     try {
-      const [jobsData, health] = await Promise.all([
+      const [jobsData, health, schedule] = await Promise.all([
         newsAPI.listJobs(10),
-        newsAPI.healthCheck()
+        newsAPI.healthCheck(),
+        newsAPI.getNewsScheduleStatus()
       ]);
       setJobs(jobsData);
       setHealthStatus(health);
+      setScheduleStatus(schedule);
+      
+      // Update form with current schedule config
+      if (schedule?.schedule) {
+        setScheduleConfig({
+          schedule_type: schedule.schedule.schedule_type as 'hourly' | 'daily' | 'custom',
+          hours: schedule.schedule.hours,
+          daily_time: schedule.schedule.daily_time,
+          custom_cron: schedule.schedule.custom_cron
+        });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch data');
     } finally {
@@ -38,15 +58,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
     }
   };
 
-  const handleTriggerWorkflow = async (isMultiAgent: boolean = false) => {
+  const handleTriggerWorkflow = async () => {
     setLoading(true);
     setError(null);
     try {
-      if (isMultiAgent) {
-        await newsAPI.triggerMultiAgentWorkflow(selectedDate);
-      } else {
-        await newsAPI.triggerNewsWorkflowWithDate(selectedDate);
-      }
+      await newsAPI.triggerNewsWorkflow();
       // Refresh jobs after triggering
       await fetchData();
     } catch (err) {
@@ -56,16 +72,30 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
     }
   };
 
-  const handleDateChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const newDate = e.target.value;
-    // Prevent selecting future dates
-    const today = new Date().toISOString().split('T')[0];
-    if (newDate > today) {
-      setError('Cannot select future dates for news scraping');
-      return;
-    }
+  const handleStartSchedule = async () => {
+    setScheduleLoading(true);
     setError(null);
-    setSelectedDate(newDate);
+    try {
+      await newsAPI.startNewsSchedule(scheduleConfig);
+      await fetchData(); // Refresh to get updated status
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to start schedule');
+    } finally {
+      setScheduleLoading(false);
+    }
+  };
+
+  const handleStopSchedule = async () => {
+    setScheduleLoading(true);
+    setError(null);
+    try {
+      await newsAPI.stopNewsSchedule();
+      await fetchData(); // Refresh to get updated status
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to stop schedule');
+    } finally {
+      setScheduleLoading(false);
+    }
   };
 
   const getStatusColor = (status: string) => {
@@ -133,53 +163,160 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
 
           {/* Workflow Controls */}
           <div className="mb-8">
-            <h3 className="text-lg font-semibold text-gray-900 mb-4">Workflow Controls</h3>
+            <h3 className="text-lg font-semibold text-gray-900 mb-4">Manual Workflow Controls</h3>
             
-            {/* Date Selection */}
-            <div className="mb-4">
-              <label htmlFor="workflow-date" className="block text-sm font-medium text-gray-700 mb-2">
-                Select Date for News Scraping:
-              </label>
-              <input
-                id="workflow-date"
-                type="date"
-                value={selectedDate}
-                onChange={handleDateChange}
-                max={new Date().toISOString().split('T')[0]}
-                className="px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              />
-              <p className="text-xs text-gray-500 mt-1">
-                Choose a date to scrape historical news. Current date is selected by default.
+            <div className="mb-4 p-4 bg-blue-50 border border-blue-200 rounded-md">
+              <p className="text-sm text-blue-800">
+                📝 <strong>Manual On-Demand Workflows</strong> - Process current date only
+              </p>
+              <p className="text-xs text-blue-600 mt-1">
+                For historical dates, use the date selector in the main interface to view already processed news from the database.
               </p>
             </div>
             
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="flex justify-center">
               <button
-                onClick={() => handleTriggerWorkflow(false)}
+                onClick={handleTriggerWorkflow}
                 disabled={loading}
-                className="flex items-center justify-center space-x-2 px-4 py-3 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-400 transition-colors"
+                className="flex items-center justify-center space-x-2 px-6 py-3 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-400 transition-colors"
               >
                 <Play className="w-4 h-4" />
-                <span>Start Traditional Workflow</span>
-              </button>
-              
-              <button
-                onClick={() => handleTriggerWorkflow(true)}
-                disabled={loading}
-                className="flex items-center justify-center space-x-2 px-4 py-3 bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:bg-gray-400 transition-colors"
-              >
-                <Users className="w-4 h-4" />
-                <span>Start Multi-Agent Workflow</span>
+                <span>Start News Workflow</span>
               </button>
             </div>
+          </div>
+
+          {/* Schedule Configuration */}
+          <div className="mb-8">
+            <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
+              <Clock className="w-5 h-5 mr-2" />
+              Automated Schedule Configuration
+            </h3>
             
-            {selectedDate !== new Date().toISOString().split('T')[0] && (
-              <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
-                <p className="text-sm text-yellow-800">
-                  📅 Historical date selected: {new Date(selectedDate).toLocaleDateString()}
-                </p>
+            {scheduleStatus && (
+              <div className={`mb-4 p-4 border rounded-md ${
+                scheduleStatus.schedule.enabled 
+                  ? 'bg-green-50 border-green-200' 
+                  : 'bg-gray-50 border-gray-200'
+              }`}>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium">
+                      Status: {scheduleStatus.schedule.enabled ? 'Enabled' : 'Disabled'}
+                    </p>
+                    {scheduleStatus.schedule.enabled && (
+                      <p className="text-xs text-gray-600 mt-1">
+                        Current: {scheduleStatus.schedule.schedule_type} 
+                        {scheduleStatus.schedule.schedule_type === 'hourly' && ` (every ${scheduleStatus.schedule.hours}h)`}
+                        {scheduleStatus.schedule.schedule_type === 'daily' && ` (at ${scheduleStatus.schedule.daily_time}:00)`}
+                        {scheduleStatus.schedule.schedule_type === 'custom' && ` (${scheduleStatus.schedule.custom_cron})`}
+                      </p>
+                    )}
+                  </div>
+                  <button
+                    onClick={scheduleStatus.schedule.enabled ? handleStopSchedule : handleStartSchedule}
+                    disabled={scheduleLoading}
+                    className={`px-4 py-2 text-sm font-medium rounded-md transition-colors ${
+                      scheduleStatus.schedule.enabled
+                        ? 'bg-red-100 text-red-700 hover:bg-red-200'
+                        : 'bg-green-100 text-green-700 hover:bg-green-200'
+                    }`}
+                  >
+                    {scheduleLoading ? 'Updating...' : scheduleStatus.schedule.enabled ? 'Stop' : 'Start'}
+                  </button>
+                </div>
               </div>
             )}
+
+            <div className="space-y-4">
+              {/* Schedule Type Selection */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Schedule Type</label>
+                <select
+                  value={scheduleConfig.schedule_type}
+                  onChange={(e) => setScheduleConfig({
+                    ...scheduleConfig, 
+                    schedule_type: e.target.value as 'hourly' | 'daily' | 'custom'
+                  })}
+                  className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                >
+                  <option value="hourly">Hourly</option>
+                  <option value="daily">Daily</option>
+                  <option value="custom">Custom Cron</option>
+                </select>
+              </div>
+
+              {/* Hourly Configuration */}
+              {scheduleConfig.schedule_type === 'hourly' && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">Every X Hours</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="24"
+                    value={scheduleConfig.hours}
+                    onChange={(e) => setScheduleConfig({
+                      ...scheduleConfig, 
+                      hours: parseInt(e.target.value) || 1
+                    })}
+                    className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">Run every {scheduleConfig.hours} hours</p>
+                </div>
+              )}
+
+              {/* Daily Configuration */}
+              {scheduleConfig.schedule_type === 'daily' && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">Hour of Day (24h format)</label>
+                  <input
+                    type="number"
+                    min="0"
+                    max="23"
+                    value={scheduleConfig.daily_time}
+                    onChange={(e) => setScheduleConfig({
+                      ...scheduleConfig, 
+                      daily_time: parseInt(e.target.value) || 9
+                    })}
+                    className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">Run daily at {scheduleConfig.daily_time}:00</p>
+                </div>
+              )}
+
+              {/* Custom Cron Configuration */}
+              {scheduleConfig.schedule_type === 'custom' && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">Cron Expression</label>
+                  <input
+                    type="text"
+                    value={scheduleConfig.custom_cron}
+                    onChange={(e) => setScheduleConfig({
+                      ...scheduleConfig, 
+                      custom_cron: e.target.value
+                    })}
+                    className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                    placeholder="0 */1 * * *"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">
+                    5-part format: minute hour day month day_of_week<br/>
+                    Example: "0 */2 * * *" = every 2 hours
+                  </p>
+                </div>
+              )}
+
+              {/* Update Schedule Button */}
+              <div className="flex justify-center">
+                <button
+                  onClick={handleStartSchedule}
+                  disabled={scheduleLoading}
+                  className="flex items-center justify-center space-x-2 px-6 py-3 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-400 transition-colors"
+                >
+                  <Settings className="w-4 h-4" />
+                  <span>{scheduleLoading ? 'Updating...' : 'Update Schedule'}</span>
+                </button>
+              </div>
+            </div>
           </div>
 
           {/* Recent Jobs */}

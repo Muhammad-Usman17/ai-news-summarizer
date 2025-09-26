@@ -1,5 +1,6 @@
 import time
 import asyncio
+import uuid
 from typing import List, Dict, Any
 from datetime import datetime
 from prometheus_client import Counter
@@ -14,6 +15,21 @@ from app.config.database import SessionLocal
 from app.models.news import NewsAnalysis
 from app.services.redis_stream import RedisStreamService
 from app.services.groq_client import GroqClient
+
+
+def ensure_json_serializable(obj):
+    """
+    Recursively convert UUID objects to strings to ensure JSON serializability.
+    """
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {k: ensure_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [ensure_json_serializable(item) for item in obj]
+    else:
+        return obj
+from app.agents.news_processing_core import NewsProcessingCore
 
 logger = get_logger(__name__)
 settings = get_settings()
@@ -92,7 +108,7 @@ class AnalystAgent:
             # Generate overall trend analysis
             if analyses:
                 try:
-                    overall_analysis = await self._generate_overall_analysis(summaries, analyses)
+                    overall_analysis = await self._generate_overall_trends_analysis(summaries, analyses)
                     analyses.append(overall_analysis)
                 except Exception as e:
                     logger.error("Failed to generate overall analysis", error=str(e))
@@ -123,7 +139,7 @@ class AnalystAgent:
     
     async def _analyze_summary(self, summary: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Analyze a single summary using Groq for fast insights.
+        Analyze a single summary using NewsProcessingCore.
         
         Args:
             summary: Summary dictionary
@@ -135,8 +151,13 @@ class AnalystAgent:
         summary_text = summary.get("summary", "")
         bullet_points = summary.get("bullet_points", [])
         
-        # Use fast Groq analysis
-        return await self._direct_groq_analyze(article_title, summary_text, bullet_points)
+        # Use shared core logic
+        return await NewsProcessingCore.deep_analyze(
+            title=article_title,
+            summary=summary_text,
+            bullet_points=bullet_points,
+            groq_client=self.groq_client
+        )
     
     async def _analyze_summary_with_semaphore(self, semaphore: asyncio.Semaphore, index: int, summary: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -166,12 +187,19 @@ class AnalystAgent:
                 
                 processing_time = time.time() - start_time
                 
-                # Use the actual database ID from the summary
-                summary_id = summary.get("id") or summary.get("db_id") or (index + 1)
+                # Use the actual database UUID ID from the summary
+                summary_id = summary.get("id") or summary.get("db_id")
+                if not summary_id:
+                    logger.error("Missing summary ID - cannot create analysis", 
+                               article_title=summary.get("article_title", "")[:50])
+                    return None
+                
+                # Convert UUID to string for JSON serialization
+                summary_id_str = str(summary_id) if summary_id else None
                 
                 # Prepare analysis data
                 analysis_data = {
-                    "summary_id": summary_id,
+                    "summary_id": summary_id_str,
                     "analysis": analysis_result["analysis"],
                     "insights": analysis_result["insights"],
                     "impact_assessment": analysis_result["impact_assessment"],
@@ -194,194 +222,6 @@ class AnalystAgent:
                            error=str(e))
                 return None
     
-    async def _direct_groq_analyze(self, title: str, summary: str, bullet_points: List[str]) -> Dict[str, Any]:
-        """
-        Fast analysis method using Groq API.
-        
-        Args:
-            title: Article title
-            summary: Article summary
-            bullet_points: Key points
-            
-        Returns:
-            Dict containing analysis components
-        """
-        bullet_text = "\n".join([f"• {point}" for point in bullet_points])
-        
-        prompt = f"""Analyze this tech news quickly:
-
-Title: {title}
-Summary: {summary}
-Key Points:
-{bullet_text}
-
-Provide concise analysis in exactly this format:
-ANALYSIS: [Why this matters - 1-2 sentences]
-
-INSIGHTS:
-• [Business implication]
-• [Technology implication] 
-• [Market implication]
-
-IMPACT: [Short and long-term effects - 1-2 sentences]"""
-        
-        try:
-            response = await self.groq_client.generate(
-                prompt=prompt,
-                model=self.groq_client.get_fast_model(),  # Use fastest model
-                max_tokens=400,  # Reduced for faster processing
-                temperature=0.2  # Lower temperature for consistent analysis
-            )
-            
-            # Parse the response
-            return self._parse_analysis_response(response)
-            
-        except Exception as e:
-            logger.error("Groq analysis failed", error=str(e))
-            
-            # Fast fallback without LLM
-            return {
-                "analysis": f"Breaking tech news: {title} - Analysis processing failed",
-                "insights": ["Technology sector development", "Market implications pending", "Industry impact assessment needed"],
-                "impact_assessment": "Full impact analysis temporarily unavailable"
-            }
-    
-    async def _generate_overall_analysis(self, summaries: List[Dict[str, Any]], analyses: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Generate an overall trend analysis from all summaries.
-        
-        Args:
-            summaries: List of summary dictionaries
-            analyses: List of individual analyses
-            
-        Returns:
-            Dict containing overall analysis
-        """
-        # Prepare combined context
-        titles = [s.get("article_title", "") for s in summaries]
-        summary_texts = [s.get("summary", "") for s in summaries]
-        
-        prompt = f"""
-        Based on today's news stories, provide an overall trend analysis:
-        
-        News Headlines:
-        {chr(10).join([f"{i+1}. {title}" for i, title in enumerate(titles)])}
-        
-        Summaries:
-        {chr(10).join([f"{i+1}. {text}" for i, text in enumerate(summary_texts)])}
-        
-        Please provide:
-        1. Overall Analysis: What are the main themes and trends?
-        2. Key Insights: What patterns or connections do you see?
-        3. Impact Assessment: What could these developments mean collectively?
-        
-        Format your response as:
-        ANALYSIS: [overall analysis]
-        
-        INSIGHTS:
-        • [trend insight 1]
-        • [trend insight 2]
-        • [trend insight 3]
-        
-        IMPACT: [collective impact assessment]
-        """
-        
-        try:
-            # Use Groq for fast overall analysis
-            response = await self.groq_client.generate(
-                prompt=prompt,
-                model=self.groq_client.get_quality_model(),  # Use quality model for overall analysis
-                max_tokens=500,
-                temperature=0.3
-            )
-            
-            # Parse and format the response
-            result = self._parse_analysis_response(response)
-            
-            # Mark this as overall analysis
-            result.update({
-                "summary_id": 0,  # Special ID for overall analysis
-                "processing_time": 0.0,
-                "article_title": "Overall Trend Analysis",
-                "article_url": ""
-            })
-            
-            return result
-            
-        except Exception as e:
-            logger.error("Failed to generate overall analysis", error=str(e))
-            return {
-                "summary_id": 0,
-                "analysis": "Overall trend analysis not available",
-                "insights": ["Analysis generation failed"],
-                "impact_assessment": "Impact assessment not available",
-                "processing_time": 0.0,
-                "article_title": "Overall Trend Analysis",
-                "article_url": ""
-            }
-    
-    def _parse_analysis_response(self, response: str) -> Dict[str, Any]:
-        """
-        Parse the LLM response into structured analysis format.
-        
-        Args:
-            response: Raw LLM response
-            
-        Returns:
-            Dict with analysis, insights, and impact assessment
-        """
-        try:
-            lines = response.strip().split('\n')
-            analysis = ""
-            insights = []
-            impact_assessment = ""
-            
-            current_section = None
-            
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                
-                if line.upper().startswith('ANALYSIS:'):
-                    analysis = line[9:].strip()
-                    current_section = "analysis"
-                elif line.upper().startswith('INSIGHTS:'):
-                    current_section = "insights"
-                elif line.upper().startswith('IMPACT:'):
-                    impact_assessment = line[7:].strip()
-                    current_section = "impact"
-                elif line.startswith('•') or line.startswith('-') or line.startswith('*'):
-                    if current_section == "insights":
-                        insights.append(line[1:].strip())
-                elif current_section == "analysis" and not analysis:
-                    analysis = line
-                elif current_section == "impact" and not impact_assessment:
-                    impact_assessment = line
-            
-            # Ensure we have content
-            if not analysis:
-                analysis = "Analysis not available"
-            
-            if not insights:
-                insights = ["Insights not available"]
-                
-            if not impact_assessment:
-                impact_assessment = "Impact assessment not available"
-            
-            return {
-                "analysis": analysis,
-                "insights": insights,
-                "impact_assessment": impact_assessment
-            }
-            
-        except Exception as e:
-            logger.error("Failed to parse analysis response", error=str(e))
-            return {
-                "analysis": "Parsing failed",
-                "insights": ["Response parsing error"],
-                "impact_assessment": "Impact assessment parsing failed"
-            }
     
     async def _save_analyses(self, analyses: List[Dict[str, Any]]):
         """
@@ -390,14 +230,33 @@ IMPACT: [Short and long-term effects - 1-2 sentences]"""
         Args:
             analyses: List of analysis dictionaries
         """
+        import uuid
+        from app.models.news import NewsJob
+        
         db = SessionLocal()
         try:
+            # Get the actual job UUID from the job_id string
+            job = db.query(NewsJob).filter(NewsJob.job_id == self.job_id).first()
+            if not job:
+                logger.error(f"Job not found in database: {self.job_id}")
+                raise ValueError(f"Job not found: {self.job_id}")
+            
+            job_uuid = job.id  # This is the UUID primary key
+            logger.info(f"Found job UUID: {job_uuid} for job_id: {self.job_id}")
+            
             for analysis_data in analyses:
+                # Ensure JSON serializable data
+                insights_safe = ensure_json_serializable(analysis_data["insights"])
+                summary_ids_safe = ensure_json_serializable([analysis_data["summary_id"]])
+                
+                logger.debug(f"Creating NewsAnalysis with job_id type: {type(job_uuid)}")
+                logger.debug(f"Summary ID types: {[type(sid) for sid in summary_ids_safe]}")
+                
                 analysis = NewsAnalysis(
-                    job_id=self.job_id,
-                    summary_ids=[analysis_data["summary_id"]],  # Store as a list to match the model
+                    job_id=job_uuid,  # Use the UUID, not the string
+                    summary_ids=summary_ids_safe,  # Store as a list to match the model
                     analysis=analysis_data["analysis"],
-                    insights=analysis_data["insights"],
+                    insights=insights_safe,
                     impact_assessment=analysis_data["impact_assessment"],
                     processing_time=analysis_data["processing_time"],
                     created_at=datetime.utcnow()
@@ -416,3 +275,48 @@ IMPACT: [Short and long-term effects - 1-2 sentences]"""
             raise
         finally:
             db.close()
+
+    async def _generate_overall_trends_analysis(self, summaries: List[Dict], analyses: List[Dict]) -> Dict[str, Any]:
+        """
+        Generate overall trends analysis using NewsProcessingCore.
+        
+        Args:
+            summaries: List of processed summaries
+            analyses: List of individual analyses
+            
+        Returns:
+            Overall trends analysis dictionary
+        """
+        try:
+            # Extract titles and summary texts from the dictionaries
+            titles = [s.get("article_title", "") for s in summaries]
+            summary_texts = [s.get("summary", "") for s in summaries]
+            
+            trends_result = await NewsProcessingCore.generate_overall_trends(
+                titles=titles,
+                summaries=summary_texts,
+                groq_client=self.groq_client
+            )
+            
+            return {
+                "summary_id": "overall_trends",
+                "analysis": trends_result["trends"],
+                "insights": trends_result["insights"],
+                "impact_assessment": trends_result["impact_assessment"],
+                "processing_time": 0.0,  # Will be calculated elsewhere
+                "article_title": "Overall Market Trends Analysis",
+                "article_url": ""
+            }
+            
+        except Exception as e:
+            logger.error("Failed to generate overall trends analysis", error=str(e))
+            # Return fallback analysis
+            return {
+                "summary_id": "overall_trends",
+                "analysis": "Overall trends analysis not available",
+                "insights": ["Analysis generation failed"],
+                "impact_assessment": "Unable to assess overall impact",
+                "processing_time": 0.0,
+                "article_title": "Overall Market Trends Analysis",
+                "article_url": ""
+            }

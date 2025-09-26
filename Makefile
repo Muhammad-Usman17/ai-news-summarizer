@@ -10,7 +10,8 @@ help:
 	@echo "  dev-down       - Stop development dependencies"
 	@echo "  dev-logs       - Show development logs"
 	@echo "  dev-run-api    - Run FastAPI service locally"
-	@echo "  dev-run-worker - Run Celery worker locally"
+	@echo "  dev-run-worker - Run Celery worker locally (concurrency=2)"
+	@echo "  dev-run-beat   - Run Celery beat scheduler locally"
 	@echo "  dev-run-temporal - Run Temporal worker locally"
 	@echo "  prod-build     - Build production containers"
 	@echo "  prod-up        - Start production services"
@@ -51,8 +52,16 @@ dev-run-api:
 	python3 -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 dev-run-worker:
-	@echo "Starting Celery worker locally..."
-	python3 -m celery -A app.celery_app worker --loglevel=info
+	@echo "Starting Celery worker locally with concurrency=2..."
+	python3 -m celery -A app.celery_app worker --loglevel=info --concurrency=2
+
+dev-run-beat:
+	@echo "Starting Celery beat scheduler with auto-restart watchdog..."
+	python3 scripts/celery_beat_watchdog.py
+
+dev-run-beat-simple:
+	@echo "Starting Celery beat scheduler locally..."
+	python3 -m celery -A app.celery_app beat --loglevel=info
 
 dev-run-temporal:
 	@echo "Starting Temporal worker locally..."
@@ -125,3 +134,4 @@ dev: dev-setup dev-up
 	@echo "Run 'make dev-run-api' in another terminal to start the API"
 	@echo "Run 'make dev-run-worker' in another terminal to start Celery"
 	@echo "Run 'make dev-run-temporal' in another terminal to start Temporal worker"
+	@echo "Run 'make dev-run-hourly' in another terminal to start automatic scheduled processing"

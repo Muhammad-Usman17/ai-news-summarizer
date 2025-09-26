@@ -1,16 +1,15 @@
-# AI News Summarizer with Multi-Agent Intelligence
+# AI News Summarizer with Intelligent Processing
 
-A next-generation AI-powered news analysis platform featuring collaborative AI agents, historical data processing, and real-time insights. Built with modern microservices architecture and advanced LLM capabilities.
+A next-generation AI-powered news analysis platform featuring intelligent processing, historical data processing, and real-time insights. Built with modern microservices architecture and advanced LLM capabilities.
 
 ## ✨ Key Features
 
-### 🤖 **Multi-Agent Collaboration**
+### 🤖 **Intelligent Processing**
 
-- **4 Specialized AI Agents** working together through AutoGen conversations
-- **NewsumMarizer**: Creates comprehensive article summaries
-- **NewsAnalyst**: Provides deep market and trend analysis
-- **QualityReviewer**: Reviews and improves content quality
-- **WorkflowCoordinator**: Orchestrates final polished output
+- **Smart Summarization**: AI-powered article summaries
+- **Trend Analysis**: Pattern recognition across news articles
+- **Quality Assessment**: Content evaluation and improvement
+- **Impact Analysis**: Market and business impact evaluation
 
 ### 📅 **Historical Data Processing**
 
@@ -30,7 +29,7 @@ A next-generation AI-powered news analysis platform featuring collaborative AI a
 - **Interactive Timeline**: Date-picker with historical news browsing
 - **Real-time Dashboard**: Live job monitoring and results
 - **Responsive Design**: Tailwind CSS with modern UI components
-- **Workflow Controls**: Easy switching between traditional and multi-agent processing
+- **Workflow Controls**: Easy job management and monitoring
 
 ## 🏗️ Architecture
 
@@ -39,7 +38,6 @@ A next-generation AI-powered news analysis platform featuring collaborative AI a
 - **PostgreSQL**: Advanced relational database with JSON querying
 - **Redis Streams**: Real-time event streaming and pub/sub
 - **Groq AI**: Ultra-fast LLM inference with multiple model support
-- **AutoGen**: Multi-agent conversation framework
 - **React + TypeScript**: Modern frontend with type safety
 - **Docker**: Containerized microservices architecture
 
@@ -90,9 +88,6 @@ A next-generation AI-powered news analysis platform featuring collaborative AI a
    # Traditional workflow
    curl -X POST http://localhost:8000/news/run
 
-   # Multi-agent workflow
-   curl -X POST http://localhost:8000/news/multi-agent
-
    # Historical date processing
    curl -X POST "http://localhost:8000/news/run?target_date=2025-09-20"
 
@@ -118,8 +113,7 @@ make prod-up
 
 ### 🔄 Workflow Endpoints
 
-- `POST /news/run` - Traditional news workflow
-- `POST /news/multi-agent` - Multi-agent collaborative workflow
+- `POST /news/run` - News processing workflow
 - `POST /news/run?target_date=YYYY-MM-DD` - Historical date processing
 
 ### 📊 Data & Analytics
@@ -146,8 +140,8 @@ make prod-up
 ### 🎯 Example Usage
 
 ```bash
-# 1. Start a multi-agent workflow with historical date
-RESPONSE=$(curl -X POST "http://localhost:8000/news/multi-agent?target_date=2025-09-20")
+# 1. Start a workflow with historical date
+RESPONSE=$(curl -X POST "http://localhost:8000/news/run?target_date=2025-09-20")
 JOB_ID=$(echo $RESPONSE | jq -r '.job_id')
 
 # 2. Stream real-time updates
@@ -156,8 +150,8 @@ curl -N http://localhost:8000/news/stream/$JOB_ID
 # 3. Get timeline for specific date
 curl "http://localhost:8000/news/timeline?date=2025-09-20" | jq '.'
 
-# 4. Get job results with multi-agent analysis
-curl http://localhost:8000/news/jobs/$JOB_ID/result | jq '.multi_agent_results'
+# 4. Get job results with analysis
+curl http://localhost:8000/news/jobs/$JOB_ID/result | jq '.'
 
 # 5. Sync database and get latest counts
 curl -X POST http://localhost:8000/news/sync-data | jq '.data_counts'
@@ -165,23 +159,12 @@ curl -X POST http://localhost:8000/news/sync-data | jq '.data_counts'
 
 ## 🔄 Workflow Processes
 
-### 🤖 Multi-Agent Collaborative Workflow
+### 📰 News Processing Workflow
 
 1. **Smart Scraping**: RSS feed processing with published date extraction
-2. **Agent Collaboration**: 4 AI agents working through AutoGen conversations
-   - **NewsumMarizer** → Creates initial summary
-   - **NewsAnalyst** → Provides market analysis
-   - **QualityReviewer** → Reviews and improves quality
-   - **WorkflowCoordinator** → Produces final polished output
+2. **AI Processing**: Intelligent summarization and analysis
 3. **Database Integration**: Proper foreign key relationships and data integrity
 4. **Real-time Streaming**: Live updates via Redis Streams
-
-### 📰 Traditional Workflow
-
-1. **Article Extraction**: Multi-source RSS processing
-2. **Groq Summarization**: Ultra-fast LLM summarization
-3. **Trend Analysis**: Cross-article pattern recognition
-4. **Impact Assessment**: Business and market impact evaluation
 
 ### 📅 Historical Processing
 
@@ -244,11 +227,6 @@ RSS_FEEDS=https://feeds.bbci.co.uk/news/rss.xml,https://techcrunch.com/feed/,htt
 TEMPORAL_HOST=localhost:7233
 TEMPORAL_NAMESPACE=default
 
-# Multi-Agent Configuration
-AUTOGEN_CACHE_SEED=42
-AGENT_TIMEOUT=120
-MAX_CONVERSATION_TURNS=8
-
 # Observability & Monitoring
 JAEGER_ENDPOINT=http://localhost:14268/api/traces
 PROMETHEUS_ENABLED=true
@@ -293,40 +271,26 @@ Structured JSON logs with correlation IDs for distributed tracing.
 - **Smart Date Parsing**: Multiple RSS date field fallbacks (published_parsed, updated_parsed, created_parsed)
 - **Database Integration**: Proper ID management for foreign key relationships
 
-### 📝 **NewsumMarizer** - Content Summarization Specialist
+### 📝 **SummarizerAgent** - Content Summarization Specialist
 
 - **Concise Summarization**: Creates clear, digestible summaries
 - **Key Point Extraction**: Bullet-point format for quick scanning
 - **Context Preservation**: Maintains important details and nuance
 - **Multi-Language Support**: Handles various content types
 
-### 📊 **NewsAnalyst** - Market Intelligence Expert
+### 📊 **AnalystAgent** - Market Intelligence Expert
 
 - **Impact Assessment**: Evaluates business and market implications
 - **Trend Analysis**: Identifies patterns across multiple articles
 - **Risk Evaluation**: Assesses potential short and long-term effects
 - **Industry Insights**: Specialized analysis for different sectors
 
-### 🔎 **QualityReviewer** - Content Quality Assurance
+### 🔎 **CriticAgent** - Content Quality Assurance
 
 - **Accuracy Review**: Validates information consistency
 - **Completeness Check**: Ensures comprehensive coverage
 - **Improvement Suggestions**: Recommends enhancements
 - **Bias Detection**: Identifies potential content bias
-
-### 🎯 **WorkflowCoordinator** - Final Output Orchestration
-
-- **Content Integration**: Merges insights from all agents
-- **Format Standardization**: Creates consistent output structure
-- **Quality Finalization**: Produces polished final deliverables
-- **Conversation Management**: Orchestrates multi-agent discussions
-
-### 🔄 **MultiAgentProcessor** - Collaboration Engine
-
-- **AutoGen Integration**: Manages agent conversations and interactions
-- **Concurrent Processing**: Handles multiple articles simultaneously
-- **Error Handling**: Robust fallback mechanisms for reliability
-- **Performance Optimization**: Efficient resource utilization
 
 ## 🔒 Security & Production
 
@@ -347,8 +311,8 @@ ai-news-summarizer/
 │   │   ├── scraper_agent.py      # News extraction & RSS processing
 │   │   ├── summarizer_agent.py   # Content summarization
 │   │   ├── analyst_agent.py      # Market analysis & insights
-│   │   ├── multi_agent_processor.py # AutoGen orchestration
-│   │   └── simple_multi_agent.py # Lightweight agent coordination
+│   │   ├── critic_agent.py       # Quality review & improvement
+│   │   └── news_processing_core.py # Shared agent functionality
 │   ├── config/                   # ⚙️ Configuration Management
 │   │   ├── settings.py           # Environment & app settings
 │   │   ├── database.py          # PostgreSQL connection & models
@@ -358,14 +322,12 @@ ai-news-summarizer/
 │   │   └── news.py              # Articles, summaries, analyses, jobs
 │   ├── services/                 # 🔌 External Service Integrations
 │   │   ├── groq_client.py       # Groq AI LLM integration
-│   │   ├── groq_autogen_client.py # AutoGen + Groq integration
 │   │   ├── redis_stream.py      # Real-time event streaming
 │   │   ├── temporal_client.py   # Workflow orchestration
 │   │   ├── metrics.py           # Prometheus metrics
 │   │   └── tracing.py           # Distributed tracing
 │   ├── workflows/                # 📋 Temporal Workflows
-│   │   ├── news_workflow.py     # Traditional processing workflow
-│   │   ├── multi_agent_workflow.py # Multi-agent collaboration
+│   │   ├── news_workflow.py     # News processing workflow
 │   │   └── temporal_worker.py   # Temporal worker configuration
 │   └── main.py                  # 🚀 FastAPI application & API routes
 ├── frontend/                     # 🌐 React Frontend
@@ -397,8 +359,8 @@ ai-news-summarizer/
 
 1. Create agent class in `app/agents/new_agent.py`
 2. Implement `async def run()` method
-3. Add to multi-agent processor participants
-4. Update AutoGen conversation flow
+3. Add to workflow processing chain
+4. Update workflow coordination
 
 #### **New Workflow**
 
@@ -436,8 +398,8 @@ ai-news-summarizer/
 #### **🤖 AI & LLM Issues**
 
 - **Groq API errors**: Verify `GROQ_API_KEY` in `.env` file
-- **Multi-agent failures**: Check AutoGen conversation parameters and model availability
-- **Timeout errors**: Increase `AGENT_TIMEOUT` and `ARTICLE_PROCESSING_TIMEOUT`
+- **Processing failures**: Check model availability and timeout settings
+- **Timeout errors**: Increase `ARTICLE_PROCESSING_TIMEOUT`
 
 #### **🗄️ Database Issues**
 
@@ -475,7 +437,7 @@ curl http://localhost:8080                       # Temporal Web UI
 docker logs ai-news-summarizer_temporal_1       # Temporal server logs
 
 # Multi-Agent System Testing
-curl -X POST "http://localhost:8000/news/multi-agent?target_date=2025-09-20"
+curl -X POST "http://localhost:8000/news/run?target_date=2025-09-20"
 curl -N http://localhost:8000/news/stream/{job_id} # Real-time updates
 
 # Frontend Development
@@ -504,7 +466,7 @@ MIT License - see LICENSE file for details.
 
 ### ✅ **Latest Enhancements (v2.0)**
 
-- **Multi-Agent Collaboration**: 4 specialized AI agents working through AutoGen
+- **Intelligent Processing**: Advanced AI-powered news analysis
 - **Historical Data Processing**: Target any date for news analysis
 - **Enhanced Timeline**: Smart date filtering with published date priority
 - **Foreign Key Integrity**: Proper database relationships and data consistency
@@ -515,7 +477,6 @@ MIT License - see LICENSE file for details.
 ### 🔮 **Roadmap**
 
 - [ ] **Advanced Analytics Dashboard**: Trend visualization and insights
-- [ ] **Multi-Language Support**: International news sources and processing
 - [ ] **Sentiment Analysis**: Emotional tone analysis of news content
 - [ ] **API Rate Limiting**: Enhanced security and usage controls
 - [ ] **Webhook Notifications**: External system integration capabilities
@@ -523,6 +484,6 @@ MIT License - see LICENSE file for details.
 
 ---
 
-Built with ❤️ using **FastAPI** • **Temporal** • **Groq AI** • **AutoGen** • **PostgreSQL** • **React** • **TypeScript**
+Built with ❤️ using **FastAPI** • **Temporal** • **Groq AI** • **PostgreSQL** • **React** • **TypeScript**
 
-_Transforming news consumption through collaborative AI intelligence_
+_Transforming news consumption through intelligent AI processing_

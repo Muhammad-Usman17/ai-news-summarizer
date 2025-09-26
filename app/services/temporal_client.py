@@ -34,20 +34,6 @@ class TemporalClient:
         """
         return await self.service.start_news_workflow(job_id, target_date)
     
-    async def start_multi_agent_workflow(self, job_id: str, use_multi_agent: bool = True, target_date: str = None) -> str:
-        """
-        Start a multi-agent collaborative workflow.
-        
-        Args:
-            job_id: Unique job identifier
-            use_multi_agent: Whether to use collaborative multi-agent processing
-            target_date: Target date for scraping (YYYY-MM-DD format)
-            
-        Returns:
-            Workflow ID
-        """
-        return await self.service.start_multi_agent_workflow(job_id, use_multi_agent, target_date)
-    
     async def get_workflow_result(self, workflow_id: str):
         """
         Get workflow result.
@@ -79,3 +65,7 @@ class TemporalClient:
         
         handle = self.service.client.get_workflow_handle(workflow_id)
         return await handle.describe()
+
+
+# Global instance
+temporal_client = TemporalClient()

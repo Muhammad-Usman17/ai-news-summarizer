@@ -8,6 +8,7 @@ import asyncio
 import json
 import uuid
 from typing import AsyncGenerator, Optional, List, Dict, Any
+from pydantic import BaseModel
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
@@ -20,8 +21,28 @@ from app.models.news import (
     NewsJobResponse, NewsArticleResponse, NewsSummaryResponse, NewsAnalysisResponse,
     NewsStreamUpdate, NewsJobResult
 )
-from app.services.redis_stream import RedisStreamService
-from app.services.temporal_client import TemporalService
+from app.services.redis_stream import redis_stream_service
+from app.services.scheduler import (
+    trigger_manual_news_processing,
+    start_scheduled_processing,
+    stop_scheduled_processing,
+    get_schedule_status
+)
+from app.services.temporal_client import temporal_client
+from app.services.workflow_status_sync import (
+    sync_stale_jobs,
+    get_workflow_health,
+    terminate_job
+)
+
+
+class ScheduleRequest(BaseModel):
+    """Request model for schedule configuration."""
+    schedule_type: str = "hourly"
+    hours: int = 1
+    daily_time: int = 9
+    custom_cron: str = "0 */1 * * *"
+
 
 # Prometheus Metrics
 REQUEST_COUNT = Counter('http_requests_total', 'Total HTTP requests', ['method', 'endpoint'])
@@ -69,10 +90,6 @@ FastAPIInstrumentor.instrument_app(app)
 # Get tracer for this module
 tracer = get_tracer(__name__)
 
-# Initialize services
-redis_stream_service = RedisStreamService()
-temporal_service = TemporalService()
-
 
 @app.on_event("startup")
 async def startup_event():
@@ -84,8 +101,8 @@ async def startup_event():
         create_tables()
         logger.info("Database tables created")
         
-        # Initialize temporal client
-        await temporal_service.connect()
+        # Initialize Temporal client
+        await temporal_client.connect()
         logger.info("Temporal client connected")
         
         logger.info("AI News Summarizer service started successfully")
@@ -97,9 +114,13 @@ async def shutdown_event():
     with LogContext(event="shutdown"):
         logger.info("Shutting down AI News Summarizer service")
         
-        # Close temporal client
-        await temporal_service.close()
+        # Close Temporal client
+        await temporal_client.close()
         logger.info("Temporal client closed")
+        
+        # Close Redis connections if needed
+        await redis_stream_service.close()
+        logger.info("Redis connections closed")
         
         logger.info("AI News Summarizer service shutdown complete")
 
@@ -130,48 +151,28 @@ async def metrics():
 @app.post("/news/run", response_model=dict)
 async def trigger_news_workflow(
     background_tasks: BackgroundTasks,
-    target_date: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     """
-    Manually trigger the traditional news summarization workflow.
-    
-    Args:
-        target_date: Optional date in YYYY-MM-DD format to scrape historical news.
-                    If not provided, uses current date.
+    Manually trigger the traditional news summarization workflow for current date.
+    Note: Date selection has been removed - use historical endpoints for older dates.
     
     Returns:
         dict: Job information with job_id for tracking
     """
-    # Validate target_date if provided
-    parsed_date = None
-    if target_date:
-        try:
-            parsed_date = datetime.strptime(target_date, "%Y-%m-%d").date()
-            # Prevent future dates
-            if parsed_date > datetime.now().date():
-                raise HTTPException(
-                    status_code=400, 
-                    detail="Cannot scrape news for future dates. Please select today or earlier."
-                )
-        except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid date format. Use YYYY-MM-DD format."
-            )
-    else:
-        parsed_date = datetime.now().date()
+    # Use current date only - no date selection for manual triggers
+    parsed_date = datetime.now().date()
     
-    # Create job ID with date info
-    job_id = f"{parsed_date.strftime('%Y%m%d')}_{str(uuid.uuid4())[:8]}"
+    # Create job ID with date info and UUID
+    job_id = str(uuid.uuid4())
     
     with tracer.start_as_current_span("trigger_news_workflow") as span:
         span.set_attribute("job_id", job_id)
-        span.set_attribute("endpoint", "trigger_news_workflow")
+        span.set_attribute("endpoint", "trigger_news_workflow") 
         span.set_attribute("target_date", str(parsed_date))
         
         with LogContext(job_id=job_id, endpoint="trigger_news_workflow", target_date=str(parsed_date)):
-            logger.info("Triggering news summarization workflow", target_date=str(parsed_date))
+            logger.info("Triggering manual news summarization workflow", target_date=str(parsed_date))
         
         # Track request metrics
         REQUEST_COUNT.labels(method="POST", endpoint="/news/run").inc()
@@ -179,10 +180,16 @@ async def trigger_news_workflow(
         # Track request duration
         with REQUEST_DURATION.time():
             try:
-                # Create job record in database
+                # Create job record in database with UUID and new fields
                 with tracer.start_as_current_span("create_job_record"):
+                    # Explicitly generate UUID for the job
+                    job_uuid = uuid.uuid4()
+                    
                     db_job = NewsJob(
+                        id=job_uuid,  # Explicitly set the ID
                         job_id=job_id,
+                        job_type="manual",  # New field
+                        processed_date=parsed_date,  # New field
                         status="started",
                         created_at=datetime.utcnow()
                     )
@@ -195,25 +202,29 @@ async def trigger_news_workflow(
                     await redis_stream_service.publish_update(
                         job_id=job_id,
                         status="started",
-                        message=f"News summarization workflow initiated for {parsed_date}",
-                        data={"job_id": job_id, "target_date": str(parsed_date)}
+                        message=f"Manual news workflow initiated for {parsed_date}",
+                        data={
+                            "type": "job_started",
+                            "target_date": str(parsed_date),
+                            "job_type": "manual"
+                        }
                     )
                 
-                # Start Temporal workflow with date parameter
-                with tracer.start_as_current_span("start_temporal_workflow"):
-                    background_tasks.add_task(
-                        temporal_service.start_news_workflow,
-                        job_id,
-                        str(parsed_date)
+                # Trigger Celery task for news processing
+                with tracer.start_as_current_span("trigger_celery_task"):
+                    result = trigger_manual_news_processing.delay(
+                        job_id=job_id,
+                        target_date=str(parsed_date)
                     )
                 
                 span.set_attribute("status", "success")
-                logger.info("News workflow started successfully")
+                logger.info("Manual news workflow started successfully")
                 
                 return {
                     "job_id": job_id,
                     "status": "started",
-                    "message": f"News summarization workflow initiated for {parsed_date}",
+                    "job_type": "manual",
+                    "message": f"Manual news workflow initiated for {parsed_date}",
                     "target_date": str(parsed_date),
                     "stream_url": f"/news/stream/{job_id}"
                 }
@@ -221,7 +232,7 @@ async def trigger_news_workflow(
             except Exception as e:
                 span.set_attribute("status", "error")
                 span.set_attribute("error", str(e))
-                logger.error("Failed to start news workflow", error=str(e))
+                logger.error("Failed to start manual news workflow", error=str(e))
                 
                 # Update job status in database
                 if 'db_job' in locals():
@@ -233,118 +244,10 @@ async def trigger_news_workflow(
                 await redis_stream_service.publish_update(
                     job_id=job_id,
                     status="failed",
-                    message=f"Failed to start workflow: {str(e)}"
-                )
-                
-                raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/news/multi-agent", response_model=dict)
-async def trigger_multi_agent_workflow(
-    background_tasks: BackgroundTasks,
-    target_date: Optional[str] = None,
-    db: Session = Depends(get_db)
-):
-    """
-    Trigger the multi-agent collaborative news processing workflow.
-    
-    This uses SummarizerAgent, AnalystAgent, CriticAgent, and CoordinatorAgent
-    working together through AutoGen conversations for enhanced analysis.
-    
-    Args:
-        target_date: Optional date in YYYY-MM-DD format to scrape historical news.
-    
-    Returns:
-        dict: Job information with job_id for tracking
-    """
-    job_id = f"multi_agent_{str(uuid.uuid4())}"
-    
-    # Validate target_date if provided
-    parsed_date = None
-    if target_date:
-        try:
-            parsed_date = datetime.strptime(target_date, "%Y-%m-%d").date()
-            # Prevent future dates
-            if parsed_date > datetime.now().date():
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Cannot scrape future dates. Provided: {target_date}, Current: {datetime.now().date()}"
-                )
-        except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid date format. Expected YYYY-MM-DD, got: {target_date}"
-            )
-    else:
-        parsed_date = datetime.now().date()
-    
-    with LogContext(job_id=job_id, endpoint="trigger_multi_agent_workflow", target_date=str(parsed_date)):
-        logger.info("Triggering multi-agent collaborative news processing", target_date=str(parsed_date))
-        
-        # Track request metrics
-        REQUEST_COUNT.labels(method="POST", endpoint="/news/multi-agent").inc()
-        
-        # Track request duration
-        with REQUEST_DURATION.time():
-            try:
-                # Create job record in database
-                db_job = NewsJob(
-                    job_id=job_id,
-                    status="started",
-                    created_at=datetime.utcnow()
-                )
-                db.add(db_job)
-                db.commit()
-                db.refresh(db_job)
-                
-                # Send initial update to Redis stream
-                await redis_stream_service.publish_update(
-                    job_id=job_id,
-                    status="started",
-                    message=f"Multi-agent collaborative processing initiated for {parsed_date}",
+                    message=f"Failed to start workflow: {str(e)}",
                     data={
-                        "job_id": job_id,
-                        "target_date": str(parsed_date),
-                        "processing_mode": "multi_agent",
-                        "agents": ["SummarizerAgent", "AnalystAgent", "CriticAgent", "CoordinatorAgent"]
+                        "type": "job_failed"
                     }
-                )
-                
-                # Start enhanced Temporal workflow with multi-agent flag
-                background_tasks.add_task(
-                    temporal_service.start_multi_agent_workflow,
-                    job_id,
-                    True,  # use_multi_agent=True
-                    str(parsed_date)  # target_date
-                )
-                
-                logger.info("Multi-agent workflow started successfully")
-                
-                return {
-                    "job_id": job_id,
-                    "status": "started",
-                    "processing_mode": "multi_agent",
-                    "message": f"Multi-agent collaborative processing initiated for {parsed_date}",
-                    "target_date": str(parsed_date),
-                    "agents": ["SummarizerAgent", "AnalystAgent", "CriticAgent", "CoordinatorAgent"],
-                    "stream_url": f"/news/stream/{job_id}",
-                    "description": "Specialized AI agents collaborating through AutoGen conversations"
-                }
-                
-            except Exception as e:
-                logger.error("Failed to start multi-agent workflow", error=str(e))
-                
-                # Update job status in database
-                if 'db_job' in locals():
-                    db_job.status = "failed"
-                    db_job.error_message = str(e)
-                    db.commit()
-                
-                # Send error update to Redis stream
-                await redis_stream_service.publish_update(
-                    job_id=job_id,
-                    status="failed",
-                    message=f"Failed to start multi-agent workflow: {str(e)}"
                 )
                 
                 raise HTTPException(status_code=500, detail=str(e))
@@ -369,16 +272,18 @@ async def stream_news_updates(job_id: str):
             logger.info("Starting news update stream")
             
             try:
-                # Subscribe to Redis stream for this job
-                async for update in redis_stream_service.subscribe_to_updates(job_id):
-                    # Format as server-sent event
-                    event_data = json.dumps(update.dict())
-                    yield f"data: {event_data}\n\n"
-                    
-                    # Break the stream if job is completed or failed
-                    if update.status in ["completed", "failed"]:
-                        logger.info("Job finished, ending stream", status=update.status)
-                        break
+                # Subscribe to Redis pub/sub for real-time updates
+                async for update in redis_stream_service.subscribe_to_updates():
+                    # Filter updates for this specific job
+                    if update.get('job_id') == job_id:
+                        # Format as server-sent event
+                        event_data = json.dumps(update)
+                        yield f"data: {event_data}\n\n"
+                        
+                        # Break the stream if job is completed or failed
+                        if update.get('status') in ["completed", "failed"]:
+                            logger.info("Job finished, ending stream", status=update.get('status'))
+                            break
                         
             except Exception as e:
                 logger.error("Error in stream generator", error=str(e))
@@ -425,7 +330,20 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db)):
             raise HTTPException(status_code=404, detail="Job not found")
         
         logger.info("Job status retrieved", status=job.status)
-        return NewsJobResponse.from_orm(job)
+        
+        # Create response with proper UUID handling
+        job_dict = {
+            "id": str(job.id),  # Convert UUID to string
+            "job_id": job.job_id,
+            "job_type": job.job_type,
+            "workflow_run_id": job.workflow_run_id,
+            "status": job.status,
+            "processed_date": job.processed_date,
+            "created_at": job.created_at,
+            "completed_at": job.completed_at,
+            "error_message": job.error_message
+        }
+        return NewsJobResponse(**job_dict)
 
 
 @app.get("/news/jobs/{job_id}/result", response_model=NewsJobResult)
@@ -503,7 +421,24 @@ async def list_jobs(
         )
         
         logger.info("Jobs retrieved", count=len(jobs))
-        return [NewsJobResponse.from_orm(job) for job in jobs]
+        
+        # Convert jobs to response models with proper UUID handling
+        job_responses = []
+        for job in jobs:
+            job_dict = {
+                "id": str(job.id),  # Convert UUID to string
+                "job_id": job.job_id,
+                "job_type": job.job_type,
+                "workflow_run_id": job.workflow_run_id,
+                "status": job.status,
+                "processed_date": job.processed_date,
+                "created_at": job.created_at,
+                "completed_at": job.completed_at,
+                "error_message": job.error_message
+            }
+            job_responses.append(NewsJobResponse(**job_dict))
+        
+        return job_responses
 
 
 @app.get("/news/articles", response_model=list[NewsArticleResponse])
@@ -537,7 +472,23 @@ async def get_articles(
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
     
     articles = query.offset(offset).limit(limit).all()
-    return [NewsArticleResponse.from_attributes(article) for article in articles]
+    
+    # Convert articles with proper UUID handling
+    article_responses = []
+    for article in articles:
+        article_dict = {
+            "id": str(article.id),
+            "job_id": str(article.job_id),
+            "title": article.title,
+            "url": article.url,
+            "content": article.content,
+            "source": article.source,
+            "published_at": article.published_at,
+            "scraped_at": article.scraped_at
+        }
+        article_responses.append(NewsArticleResponse(**article_dict))
+    
+    return article_responses
 
 
 @app.get("/news/summaries", response_model=list[NewsSummaryResponse])
@@ -571,7 +522,23 @@ async def get_summaries(
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
     
     summaries = query.offset(offset).limit(limit).all()
-    return [NewsSummaryResponse.from_attributes(summary) for summary in summaries]
+    
+    # Convert summaries with proper UUID handling
+    summary_responses = []
+    for summary in summaries:
+        summary_dict = {
+            "id": str(summary.id),
+            "job_id": str(summary.job_id),
+            "article_id": str(summary.article_id),
+            "summary": summary.summary,
+            "bullet_points": summary.bullet_points or [],
+            "processing_time": summary.processing_time or 0.0,
+            "quality_score": summary.quality_score,
+            "created_at": summary.created_at
+        }
+        summary_responses.append(NewsSummaryResponse(**summary_dict))
+    
+    return summary_responses
 
 
 @app.get("/news/analyses", response_model=list[NewsAnalysisResponse])
@@ -605,7 +572,28 @@ async def get_analyses(
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
     
     analyses = query.offset(offset).limit(limit).all()
-    return [NewsAnalysisResponse.from_attributes(analysis) for analysis in analyses]
+    
+    # Convert analyses with proper UUID handling
+    analysis_responses = []
+    for analysis in analyses:
+        # Convert summary_ids list (if it exists) to string UUIDs
+        summary_ids = []
+        if analysis.summary_ids:
+            summary_ids = [str(sid) if isinstance(sid, uuid.UUID) else str(sid) for sid in analysis.summary_ids]
+        
+        analysis_dict = {
+            "id": str(analysis.id),
+            "job_id": str(analysis.job_id),
+            "summary_ids": summary_ids,
+            "analysis": analysis.analysis,
+            "insights": analysis.insights or [],
+            "impact_assessment": analysis.impact_assessment or "",
+            "processing_time": analysis.processing_time or 0.0,
+            "created_at": analysis.created_at
+        }
+        analysis_responses.append(NewsAnalysisResponse(**analysis_dict))
+    
+    return analysis_responses
 
 
 @app.get("/news/timeline")
@@ -621,15 +609,17 @@ async def get_news_timeline(
     Args:
         limit: Maximum number of items to return
         offset: Number of items to skip
-        date: Optional date filter (YYYY-MM-DD format)
+        date: Optional date filter (YYYY-MM-DD format). If not provided, uses current date
         
     Returns:
         dict: Combined timeline with articles, summaries, and analyses
     """
     timeline_items = []
     
-    # Parse date filter once if provided
+    # Parse date filter - use current date if not provided
     target_date = None
+    apply_date_filter = True  # Always apply date filtering
+    
     if date:
         try:
             from datetime import timedelta
@@ -642,13 +632,24 @@ async def get_news_timeline(
                 target_date = datetime.strptime(date, "%Y-%m-%d").date()
         except (ValueError, OSError):
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD or ISO 8601 format")
+    else:
+        # If no date provided, use current date
+        target_date = datetime.now().date()
+        logger.info("No date provided, using current date for timeline", current_date=str(target_date))
 
     # Get articles - filter by published_at first, fallback to scraped_at
     articles_query = db.query(NewsArticle).order_by(NewsArticle.published_at.desc().nullslast(), NewsArticle.scraped_at.desc())
+    
+    # Apply date filter (always applies now - either provided date or current date)
     if target_date:
         from datetime import timedelta
         start_of_day = datetime.combine(target_date, datetime.min.time())
         end_of_day = start_of_day + timedelta(days=1)
+        
+        logger.info("Timeline date filter applied", 
+                   target_date=str(target_date), 
+                   start_of_day=start_of_day.isoformat(), 
+                   end_of_day=end_of_day.isoformat())
         
         articles_query = articles_query.filter(
             or_(
@@ -666,8 +667,12 @@ async def get_news_timeline(
                 )
             )
         )
-    
+
     articles = articles_query.limit(limit//2).all()
+    
+    logger.info("Articles found for timeline", 
+               articles_count=len(articles),
+               target_date=str(target_date))
     
     for article in articles:
         # Use published_at if available, otherwise fall back to scraped_at
@@ -690,6 +695,8 @@ async def get_news_timeline(
         .join(NewsArticle)
         .order_by(NewsArticle.published_at.desc().nullslast(), NewsSummary.created_at.desc())
     )
+    
+    # Apply date filter (always applies now - either provided date or current date)
     if target_date:
         from datetime import timedelta
         start_of_day = datetime.combine(target_date, datetime.min.time())
@@ -711,8 +718,12 @@ async def get_news_timeline(
                 )
             )
         )
-    
+
     summaries = summaries_query.limit(limit).all()
+    
+    logger.info("Summaries found for timeline", 
+               summaries_count=len(summaries),
+               target_date=str(target_date) if target_date else "recent")
     
     # Create unified news items with all available information
     news_items_map = {}  # Use dict to avoid duplicates based on article
@@ -881,8 +892,8 @@ async def _generate_timeline_summary(news_items: List[Dict], date_filter: str = 
 @app.post("/news/sync-job-status/{job_id}")
 async def sync_job_status(job_id: str, db: Session = Depends(get_db)):
     """
-    Manually sync job status with Temporal workflow status.
-    Useful for jobs that completed in Temporal but are stuck in 'started' state in DB.
+    Manually sync job status with Celery task status.
+    Useful for jobs that completed in Celery but are stuck in 'started' state in DB.
     
     Args:
         job_id: The job ID to sync
@@ -901,7 +912,7 @@ async def sync_job_status(job_id: str, db: Session = Depends(get_db)):
             return {"job_id": job_id, "status": job.status, "message": "Job already completed or failed"}
         
         # For now, we'll mark long-running jobs as completed
-        # In a real implementation, you'd query Temporal to get actual status
+        # In a real implementation, you'd query Celery to get actual status
         from datetime import datetime, timedelta
         
         # If job is older than 1 hour and still "started", likely completed
@@ -913,7 +924,7 @@ async def sync_job_status(job_id: str, db: Session = Depends(get_db)):
             return {
                 "job_id": job_id, 
                 "status": "completed", 
-                "message": "Job marked as completed (was likely finished in Temporal)"
+                "message": "Job marked as completed (was likely finished in Celery)"
             }
         
         return {
@@ -1002,6 +1013,367 @@ async def sync_data_with_db(db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Error syncing data: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error syncing data: {str(e)}")
+
+
+async def _get_news_processing_stats(days: int, db: Session) -> Dict[str, Any]:
+    """
+    Get processing statistics for the last N days.
+    
+    Args:
+        days: Number of days to analyze
+        db: Database session
+        
+    Returns:
+        Dictionary with processing stats
+    """
+    try:
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=days)
+        
+        # Get jobs in date range
+        jobs = db.query(NewsJob).filter(
+            and_(
+                NewsJob.processed_date >= start_date,
+                NewsJob.processed_date <= end_date
+            )
+        ).all()
+        
+        stats = {
+            "date_range": {
+                "start": start_date.isoformat(),
+                "end": end_date.isoformat(),
+                "days": days
+            },
+            "total_jobs": len(jobs),
+            "completed_jobs": 0,
+            "failed_jobs": 0,
+            "in_progress_jobs": 0,
+            "total_articles": 0,
+            "job_types": {"hourly": 0, "manual": 0},
+            "daily_breakdown": []
+        }
+        
+        # Process jobs
+        daily_stats = {}
+        for job in jobs:
+            # Count by status
+            if job.status == "completed":
+                stats["completed_jobs"] += 1
+            elif job.status == "failed":
+                stats["failed_jobs"] += 1
+            else:
+                stats["in_progress_jobs"] += 1
+            
+            # Count by job type
+            if job.job_type in stats["job_types"]:
+                stats["job_types"][job.job_type] += 1
+            
+            # Count articles for completed jobs
+            if job.status == "completed":
+                articles_count = db.query(NewsArticle).filter(
+                    NewsArticle.job_id == job.id
+                ).count()
+                stats["total_articles"] += articles_count
+                
+                # Daily breakdown
+                job_date = job.processed_date or job.created_at.date()
+                date_str = job_date.isoformat()
+                
+                if date_str not in daily_stats:
+                    daily_stats[date_str] = {"date": date_str, "articles": 0, "jobs": 0}
+                daily_stats[date_str]["articles"] += articles_count
+                daily_stats[date_str]["jobs"] += 1
+        
+        stats["daily_breakdown"] = list(daily_stats.values())
+        stats["daily_breakdown"].sort(key=lambda x: x["date"], reverse=True)
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Error getting processing stats: {e}")
+        raise
+
+
+@app.get("/news/processing/stats")
+async def get_processing_statistics(days: int = 30, db: Session = Depends(get_db)):
+    """
+    Get news processing statistics for the last N days.
+    
+    Args:
+        days: Number of days to analyze (default: 30, max: 90)
+        
+    Returns:
+        dict: Processing statistics and insights
+    """
+    # Limit days to reasonable range
+    days = min(max(days, 1), 90)
+    
+    try:
+        stats = await _get_news_processing_stats(days, db)
+        
+        return {
+            "statistics": stats,
+            "insights": {
+                "success_rate": (
+                    stats["completed_jobs"] / stats["total_jobs"] * 100 
+                    if stats["total_jobs"] > 0 else 0
+                ),
+                "avg_articles_per_job": (
+                    stats["total_articles"] / stats["completed_jobs"] 
+                    if stats["completed_jobs"] > 0 else 0
+                ),
+                "most_active_job_type": max(
+                    stats["job_types"].items(), 
+                    key=lambda x: x[1], 
+                    default=("none", 0)
+                )[0]
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error retrieving processing stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/news/hourly/start")
+async def start_hourly_processing(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """
+    Start the hourly automated news processing.
+    Note: Hourly processing is now handled by the external hourly service.
+    
+    Returns:
+        dict: Information about hourly processing
+    """
+    return {
+        "status": "info",
+        "message": "Hourly processing is handled by the external hourly service. Use 'make dev-run-hourly' or 'python3 start_hourly_service.py' to start it.",
+        "service": "external",
+        "command": "python3 start_hourly_service.py"
+    }
+
+
+@app.get("/news/hourly/status")
+async def get_hourly_processing_status(db: Session = Depends(get_db)):
+    """
+    Get the status of hourly automated processing.
+    
+    Returns:
+        dict: Current status of hourly processing
+    """
+    try:
+        # Check recent hourly jobs
+        from datetime import timedelta
+        recent_hourly_jobs = db.query(NewsJob).filter(
+            and_(
+                NewsJob.job_type == "hourly",
+                NewsJob.created_at >= datetime.utcnow() - timedelta(hours=2)
+            )
+        ).order_by(NewsJob.created_at.desc()).all()
+        
+        status = {
+            "hourly_processing_active": len(recent_hourly_jobs) > 0,
+            "recent_hourly_jobs": len(recent_hourly_jobs),
+            "last_hourly_run": None,
+            "next_scheduled_run": "within next hour"
+        }
+        
+        if recent_hourly_jobs:
+            latest_job = recent_hourly_jobs[0]
+            status["last_hourly_run"] = {
+                "job_id": latest_job.job_id,
+                "status": latest_job.status,
+                "created_at": latest_job.created_at.isoformat(),
+                "completed_at": latest_job.completed_at.isoformat() if latest_job.completed_at else None
+            }
+        
+        return status
+        
+    except Exception as e:
+        logger.error(f"Error getting hourly status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/news/schedule/start")
+async def start_news_schedule(request: ScheduleRequest):
+    """
+    Start or update the news processing schedule.
+    
+    Args:
+        request: Schedule configuration request
+        
+    Returns:
+        dict: Schedule configuration and status
+    """
+    try:
+        # Validate inputs
+        if request.schedule_type not in ["hourly", "daily", "custom"]:
+            raise HTTPException(status_code=400, detail="schedule_type must be 'hourly', 'daily', or 'custom'")
+        
+        if request.schedule_type == "hourly" and not (1 <= request.hours <= 24):
+            raise HTTPException(status_code=400, detail="hours must be between 1 and 24")
+        
+        if request.schedule_type == "daily" and not (0 <= request.daily_time <= 23):
+            raise HTTPException(status_code=400, detail="daily_time must be between 0 and 23")
+        
+        if request.schedule_type == "custom" and len(request.custom_cron.split()) != 5:
+            raise HTTPException(status_code=400, detail="custom_cron must be a valid 5-part cron expression")
+        
+        # Start the schedule
+        result = start_scheduled_processing(
+            schedule_type=request.schedule_type,
+            hours=request.hours,
+            daily_time=request.daily_time,
+            custom_cron=request.custom_cron
+        )
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting news schedule: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/news/schedule/stop")
+async def stop_news_schedule():
+    """
+    Stop the news processing schedule.
+    
+    Returns:
+        dict: Status of schedule stop operation
+    """
+    try:
+        result = stop_scheduled_processing()
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error stopping news schedule: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/news/schedule/status")
+async def get_news_schedule_status():
+    """
+    Get current news processing schedule status and configuration.
+    
+    Returns:
+        dict: Current schedule configuration and status
+    """
+    try:
+        status = get_schedule_status()
+        return {
+            "timestamp": datetime.utcnow().isoformat(),
+            "schedule": status
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting schedule status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/news/schedule/reload")
+async def reload_schedule():
+    """
+    Force reload the Celery Beat schedule configuration.
+    Useful for testing and ensuring schedule changes are picked up immediately.
+    Also restarts the Celery Beat process to apply new schedule.
+    
+    Returns:
+        dict: Reload operation result
+    """
+    try:
+        from app.services.scheduler import update_schedule
+        update_schedule(restart_beat=True)
+        
+        return {
+            "success": True,
+            "message": "Schedule reloaded successfully with Celery Beat restart initiated",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error reloading schedule: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/news/workflow/sync-stale")
+async def sync_stale_workflows(max_age_hours: int = 2):
+    """
+    Sync workflows that are stuck in 'started' state.
+    
+    Args:
+        max_age_hours: Maximum hours a job can be in 'started' state (default: 2)
+        
+    Returns:
+        dict: Sync operation results
+    """
+    try:
+        results = await sync_stale_jobs(max_age_hours)
+        return {
+            "success": True,
+            "sync_results": results
+        }
+        
+    except Exception as e:
+        logger.error(f"Error syncing stale workflows: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/news/workflow/health")
+async def get_workflow_health_status():
+    """
+    Get overall workflow system health status.
+    
+    Returns:
+        dict: Health status and metrics
+    """
+    try:
+        health_status = await get_workflow_health()
+        return {
+            "timestamp": datetime.utcnow().isoformat(),
+            "health": health_status
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting workflow health: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/news/workflow/terminate/{job_id}")
+async def terminate_workflow(job_id: str, reason: str = "Manual termination"):
+    """
+    Terminate a running workflow.
+    
+    Args:
+        job_id: ID of the job to terminate
+        reason: Reason for termination
+        
+    Returns:
+        dict: Termination result
+    """
+    try:
+        success = await terminate_job(job_id, reason)
+        
+        if success:
+            return {
+                "success": True,
+                "job_id": job_id,
+                "message": f"Job terminated: {reason}"
+            }
+        else:
+            return {
+                "success": False,
+                "job_id": job_id,
+                "message": "Failed to terminate job"
+            }
+            
+    except Exception as e:
+        logger.error(f"Error terminating workflow {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

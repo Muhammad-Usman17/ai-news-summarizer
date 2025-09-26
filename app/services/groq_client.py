@@ -1,5 +1,4 @@
 import httpx
-import asyncio
 from typing import Dict, Any, Optional, List
 import json
 import os
@@ -214,3 +213,7 @@ class GroqClient:
     def get_quality_model(self) -> str:
         """Get a higher quality model for better summaries."""
         return "llama-3.3-70b-versatile"  # Higher quality but still fast
+    
+    def get_smart_model(self) -> str:
+        """Get a smart model for analysis and critique tasks."""
+        return "llama-3.3-70b-versatile"  # Higher reasoning capabilities

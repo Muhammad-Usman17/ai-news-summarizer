@@ -2,16 +2,20 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import asyncio
 from urllib.parse import urljoin, urlparse
 from prometheus_client import Counter
+import urllib3
 
 from app.config.settings import get_settings
 from app.config.logging import get_logger, LogContext
 from app.config.database import SessionLocal
 from app.models.news import NewsArticle
 from app.services.redis_stream import RedisStreamService
+
+# Disable SSL warnings for problematic feeds
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = get_logger(__name__)
 settings = get_settings()
@@ -33,23 +37,19 @@ class ScraperAgent:
         Execute the scraper agent.
         
         Args:
-            target_date: Target date for scraping in YYYY-MM-DD format
+            target_date: Deprecated - scraper now fetches latest news regardless of date
         
         Returns:
             Dict containing scraped articles
         """
-        # Store target_date for use in article processing
-        self._target_date = target_date
-        
         with LogContext(job_id=self.job_id, agent="ScraperAgent"):
-            date_msg = f" for {target_date}" if target_date else ""
-            logger.info("Starting news scraping", target_date=target_date)
+            logger.info("Starting latest news scraping")
             
             # Send status update
             await self.redis_stream.publish_update(
                 job_id=self.job_id,
                 status="scraping_started",
-                message=f"Starting news article scraping{date_msg}"
+                message="Starting latest news article scraping"
             )
             
             all_articles = []
@@ -57,8 +57,8 @@ class ScraperAgent:
             for feed_url in self.rss_feeds:
                 feed_url = feed_url.strip()
                 try:
-                    logger.info("Scraping feed", feed_url=feed_url, target_date=target_date)
-                    articles = await self._scrape_feed(feed_url, target_date)
+                    logger.info("Scraping feed for latest news", feed_url=feed_url)
+                    articles = await self._scrape_feed(feed_url)
                     all_articles.extend(articles)
                     
                 except Exception as e:
@@ -71,8 +71,8 @@ class ScraperAgent:
                        original_count=len(all_articles), 
                        unique_count=len(unique_articles))
             
-            # Limit to top 5 unique articles
-            top_articles = unique_articles[:5]
+            # Increase limit to top 10 unique articles (was 5)
+            top_articles = unique_articles[:10]
             
             # Save articles to database
             await self._save_articles(top_articles)
@@ -93,13 +93,12 @@ class ScraperAgent:
                 "selected_count": len(top_articles)
             }
     
-    async def _scrape_feed(self, feed_url: str, target_date: str = None) -> List[Dict[str, Any]]:
+    async def _scrape_feed(self, feed_url: str) -> List[Dict[str, Any]]:
         """
-        Scrape articles from a single RSS feed.
+        Scrape latest articles from a single RSS feed.
         
         Args:
             feed_url: RSS feed URL
-            target_date: Target date for filtering articles (YYYY-MM-DD format)
             
         Returns:
             List of article dictionaries
@@ -107,17 +106,36 @@ class ScraperAgent:
         articles = []
         
         try:
-            # Configure headers and SSL handling for RSS parsing
-            import ssl
-            import certifi
+            # Configure SSL handling for RSS parsing
+            logger.info("Attempting to parse RSS feed", feed_url=feed_url)
             
-            # Create SSL context that doesn't verify certificates (for problematic feeds)
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
+            # Try multiple approaches for feed parsing (prioritize working methods)
+            feed = None
+            parsing_methods = [
+                # Method 1: Using requests with SSL handling (most reliable)
+                lambda: self._parse_feed_with_requests(feed_url),
+                # Method 2: Standard parsing with user agent
+                lambda: feedparser.parse(feed_url, agent="Mozilla/5.0 (compatible; NewsBot/1.0)"),
+                # Method 3: Standard parsing
+                lambda: feedparser.parse(feed_url),
+            ]
             
-            # Parse RSS feed with better error handling
-            feed = feedparser.parse(feed_url, agent="NewsBot/1.0")
+            for i, method in enumerate(parsing_methods, 1):
+                try:
+                    logger.info(f"Trying parsing method {i}", feed_url=feed_url)
+                    feed = method()
+                    if feed and hasattr(feed, 'entries') and feed.entries:
+                        logger.info(f"Parsing method {i} successful", feed_url=feed_url, entries_count=len(feed.entries))
+                        break
+                    else:
+                        logger.warning(f"Parsing method {i} returned empty feed", feed_url=feed_url)
+                except Exception as method_error:
+                    logger.warning(f"Parsing method {i} failed", feed_url=feed_url, error=str(method_error))
+                    continue
+            
+            if not feed:
+                logger.error("All parsing methods failed", feed_url=feed_url)
+                return []
             
             if feed.bozo:
                 logger.warning("Feed parsing had issues", feed_url=feed_url, 
@@ -137,27 +155,18 @@ class ScraperAgent:
             # Extract source name from feed
             source_name = feed.feed.get('title', urlparse(feed_url).netloc)
             
-            # Track filtering statistics
-            total_entries = len(feed.entries[:10])  # We only process first 10 entries
-            filtered_by_date = 0
+            # Track processing statistics - increased from 10 to 20 articles per feed
+            total_entries = len(feed.entries[:20])  # Process first 20 entries per feed
             processed_count = 0
             
-            for i, entry in enumerate(feed.entries[:10]):  # Limit per feed
+            for i, entry in enumerate(feed.entries[:20]):  # Increased limit per feed
                 try:
-                    # Filter by date if target_date is provided
-                    if target_date and not self._is_article_from_target_date(entry, target_date):
-                        filtered_by_date += 1
-                        logger.debug("Filtered out by date", 
-                                   title=entry.get('title', 'No title')[:50],
-                                   target_date=target_date)
-                        continue
-                    
                     processed_count += 1
                     logger.info("Processing article", feed_url=feed_url, 
                                article_num=processed_count, 
                                title=entry.get('title', 'No title')[:100])
                     
-                    article = await self._extract_article_content(entry, source_name, target_date)
+                    article = await self._extract_article_content(entry, source_name)
                     if article:
                         articles.append(article)
                         logger.info("Article extracted successfully", 
@@ -171,15 +180,12 @@ class ScraperAgent:
                                entry_url=entry.get('link'), error=str(e))
                     continue
             
-            # Log filtering statistics
-            if target_date:
-                logger.info("Feed processing completed with date filtering", 
-                           source=source_name,
-                           total_entries=total_entries,
-                           filtered_by_date=filtered_by_date, 
-                           processed=processed_count,
-                           extracted=len(articles),
-                           target_date=target_date)
+            # Log processing statistics
+            logger.info("Feed processing completed", 
+                       source=source_name,
+                       total_entries=total_entries,
+                       processed=processed_count,
+                       extracted=len(articles))
                     
         except Exception as e:
             logger.error("Failed to parse RSS feed", feed_url=feed_url, error=str(e))
@@ -187,64 +193,7 @@ class ScraperAgent:
         
         return articles
     
-    def _is_article_from_target_date(self, entry, target_date: str) -> bool:
-        """
-        Check if an RSS entry is from the exact target date.
-        
-        Args:
-            entry: RSS feed entry
-            target_date: Target date in YYYY-MM-DD format
-            
-        Returns:
-            True if article is published exactly on the target date
-        """
-        try:
-            from datetime import datetime, date
-            
-            target_date_obj = datetime.strptime(target_date, "%Y-%m-%d").date()
-            
-            # Parse published date from entry
-            published_at = None
-            if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                try:
-                    published_at = datetime(*entry.published_parsed[:6]).date()
-                except Exception as e:
-                    logger.debug("Failed to parse published_parsed date", error=str(e))
-            
-            # Try alternative date fields if published_parsed failed
-            if not published_at:
-                for date_field in ['updated_parsed', 'created_parsed']:
-                    if hasattr(entry, date_field) and getattr(entry, date_field):
-                        try:
-                            published_at = datetime(*getattr(entry, date_field)[:6]).date()
-                            break
-                        except Exception as e:
-                            logger.debug(f"Failed to parse {date_field} date", error=str(e))
-            
-            # If we still don't have a published date, reject the article for strict date filtering
-            if not published_at:
-                logger.debug("No published date found for article - rejecting for date filtering",
-                           title=entry.get('title', 'No title')[:50],
-                           target_date=target_date)
-                return False
-            
-            # Only include articles from the exact target date
-            is_match = published_at == target_date_obj
-            
-            if not is_match:
-                logger.debug("Article date mismatch", 
-                           article_date=str(published_at),
-                           target_date=target_date,
-                           title=entry.get('title', 'No title')[:50])
-            
-            return is_match
-            
-        except Exception as e:
-            logger.warning("Error checking article date", error=str(e))
-            # If we can't parse dates, include the article
-            return True
-    
-    async def _extract_article_content(self, entry, source_name: str, target_date: str = None) -> Dict[str, Any]:
+    async def _extract_article_content(self, entry, source_name: str) -> Dict[str, Any]:
         """
         Extract full content from an RSS entry.
         
@@ -285,28 +234,49 @@ class ScraperAgent:
         # Use full content if available and substantial, otherwise fall back to summary
         content = full_content if full_content and len(full_content) > 200 else summary
         
-        # Parse published date with fallback logic
+        # Enhanced published date parsing with multiple fallbacks
         published_at = None
         
-        # First, try to get from RSS feed
-        if hasattr(entry, 'published_parsed') and entry.published_parsed:
-            try:
-                published_at = datetime(*entry.published_parsed[:6])
-            except:
-                pass
+        # Strategy 1: Try RSS feed date fields
+        date_fields = ['published_parsed', 'updated_parsed', 'created_parsed']
+        for field_name in date_fields:
+            if hasattr(entry, field_name):
+                field_value = getattr(entry, field_name)
+                if field_value:
+                    try:
+                        published_at = datetime(*field_value[:6])
+                        logger.debug(f"Date found in RSS {field_name}", 
+                                   title=title[:50], 
+                                   date=published_at.isoformat())
+                        break
+                    except Exception as e:
+                        logger.debug(f"Failed to parse {field_name}", error=str(e))
+                        continue
         
-        # If no RSS date and we have a target_date, use target_date as fallback
-        if not published_at and hasattr(self, '_target_date') and self._target_date:
-            try:
-                # Use target_date as the published date for historical scraping
-                target_datetime = datetime.strptime(self._target_date, "%Y-%m-%d")
-                published_at = target_datetime
-            except:
-                pass
+        # Strategy 2: Try to extract date from article page if RSS date failed
+        if not published_at:
+            page_date = await self._extract_date_from_page(url)
+            if page_date:
+                published_at = page_date
+                logger.debug("Date extracted from article page", 
+                           title=title[:50], 
+                           date=published_at.isoformat())
         
-        # If still no date, use current time (for real-time scraping)
+        # Strategy 3: Parse date from URL if available
+        if not published_at:
+            url_date = self._extract_date_from_url(url)
+            if url_date:
+                published_at = url_date
+                logger.debug("Date extracted from URL", 
+                           title=title[:50], 
+                           date=published_at.isoformat())
+        
+        # Strategy 4: Use current time as final fallback
         if not published_at:
             published_at = datetime.utcnow()
+            logger.debug("Using current time as fallback date", 
+                       title=title[:50], 
+                       date=published_at.isoformat())
         
         return {
             "title": title,
@@ -377,6 +347,189 @@ class ScraperAgent:
         except Exception as e:
             logger.warning("Failed to scrape article content", url=url, error=str(e))
             return ""
+    
+    async def _extract_date_from_page(self, url: str) -> Optional[datetime]:
+        """
+        Try to extract publication date from article HTML page.
+        
+        Args:
+            url: Article URL
+            
+        Returns:
+            Parsed datetime or None if not found
+        """
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (compatible; NewsBot/1.0)'
+            }
+            
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Strategy 1: JSON-LD structured data
+            json_ld_scripts = soup.find_all('script', type='application/ld+json')
+            for script in json_ld_scripts:
+                try:
+                    import json
+                    data = json.loads(script.string)
+                    if isinstance(data, list):
+                        data = data[0]
+                    
+                    # Look for datePublished or dateCreated
+                    for date_field in ['datePublished', 'dateCreated', 'dateModified']:
+                        if date_field in data:
+                            date_str = data[date_field]
+                            parsed_date = self._parse_date_string(date_str)
+                            if parsed_date:
+                                logger.debug(f"Date found in JSON-LD {date_field}", date=parsed_date.isoformat())
+                                return parsed_date
+                except Exception as e:
+                    logger.debug("Failed to parse JSON-LD", error=str(e))
+                    continue
+            
+            # Strategy 2: Meta tags
+            meta_selectors = [
+                'meta[property="article:published_time"]',
+                'meta[name="publishdate"]', 
+                'meta[name="date"]',
+                'meta[name="publish-date"]',
+                'meta[property="og:published_time"]',
+                'meta[name="article:published_time"]'
+            ]
+            
+            for selector in meta_selectors:
+                meta_tag = soup.select_one(selector)
+                if meta_tag:
+                    content = meta_tag.get('content')
+                    if content:
+                        parsed_date = self._parse_date_string(content)
+                        if parsed_date:
+                            logger.debug(f"Date found in meta tag {selector}", date=parsed_date.isoformat())
+                            return parsed_date
+            
+            # Strategy 3: Time elements with datetime attribute
+            time_elements = soup.find_all('time', attrs={'datetime': True})
+            for time_elem in time_elements:
+                datetime_attr = time_elem.get('datetime')
+                if datetime_attr:
+                    parsed_date = self._parse_date_string(datetime_attr)
+                    if parsed_date:
+                        logger.debug("Date found in time element", date=parsed_date.isoformat())
+                        return parsed_date
+            
+            # Strategy 4: Common date classes/patterns in text
+            date_selectors = [
+                '.date', '.publish-date', '.published', '.article-date',
+                '.post-date', '.entry-date', '.timestamp'
+            ]
+            
+            for selector in date_selectors:
+                date_elem = soup.select_one(selector)
+                if date_elem:
+                    date_text = date_elem.get_text(strip=True)
+                    parsed_date = self._parse_date_string(date_text)
+                    if parsed_date:
+                        logger.debug(f"Date found in element {selector}", date=parsed_date.isoformat())
+                        return parsed_date
+            
+            logger.debug("No date found in article page", url=url[:100])
+            return None
+            
+        except Exception as e:
+            logger.debug("Failed to extract date from page", url=url[:100], error=str(e))
+            return None
+    
+    def _extract_date_from_url(self, url: str) -> Optional[datetime]:
+        """
+        Try to extract date from URL pattern.
+        
+        Args:
+            url: Article URL
+            
+        Returns:
+            Parsed datetime or None if not found
+        """
+        import re
+        
+        try:
+            # Common URL date patterns
+            patterns = [
+                r'/(\d{4})/(\d{1,2})/(\d{1,2})/',  # /2025/09/24/
+                r'/(\d{4})-(\d{1,2})-(\d{1,2})/',  # /2025-09-24/
+                r'_(\d{4})(\d{2})(\d{2})_',        # _20250924_
+                r'-(\d{4})(\d{2})(\d{2})-',        # -20250924-
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, url)
+                if match:
+                    year, month, day = match.groups()
+                    try:
+                        parsed_date = datetime(int(year), int(month), int(day))
+                        logger.debug("Date extracted from URL pattern", 
+                                   pattern=pattern, 
+                                   date=parsed_date.isoformat())
+                        return parsed_date
+                    except ValueError:
+                        continue
+            
+            logger.debug("No date pattern found in URL", url=url[:100])
+            return None
+            
+        except Exception as e:
+            logger.debug("Failed to extract date from URL", url=url[:100], error=str(e))
+            return None
+    
+    def _parse_date_string(self, date_str: str) -> Optional[datetime]:
+        """
+        Parse various date string formats.
+        
+        Args:
+            date_str: Date string to parse
+            
+        Returns:
+            Parsed datetime or None if parsing failed
+        """
+        if not date_str or not isinstance(date_str, str):
+            return None
+        
+        # Clean the date string
+        date_str = date_str.strip()
+        
+        # Common date formats to try
+        formats = [
+            '%Y-%m-%dT%H:%M:%SZ',           # 2025-09-24T10:30:00Z
+            '%Y-%m-%dT%H:%M:%S%z',          # 2025-09-24T10:30:00+00:00
+            '%Y-%m-%dT%H:%M:%S',            # 2025-09-24T10:30:00
+            '%Y-%m-%d %H:%M:%S',            # 2025-09-24 10:30:00
+            '%Y-%m-%d',                     # 2025-09-24
+            '%d %B %Y',                     # 24 September 2025
+            '%B %d, %Y',                    # September 24, 2025
+            '%d %b %Y',                     # 24 Sep 2025
+            '%b %d, %Y',                    # Sep 24, 2025
+        ]
+        
+        for fmt in formats:
+            try:
+                parsed_date = datetime.strptime(date_str, fmt)
+                return parsed_date
+            except ValueError:
+                continue
+        
+        # Try with dateutil as fallback (more flexible parsing)
+        try:
+            from dateutil import parser
+            parsed_date = parser.parse(date_str)
+            return parsed_date
+        except ImportError:
+            logger.debug("dateutil not available, skipping flexible parsing")
+        except Exception:
+            pass
+        
+        logger.debug("Failed to parse date string", date_str=date_str[:50])
+        return None
     
     async def _remove_duplicates(self, articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -453,6 +606,38 @@ class ScraperAgent:
             logger.warning("Error checking database for duplicates", error=str(e))
             return False
     
+    def _parse_feed_with_requests(self, feed_url: str):
+        """
+        Parse RSS feed using requests with SSL verification disabled as fallback.
+        
+        Args:
+            feed_url: RSS feed URL
+            
+        Returns:
+            Parsed feed object or None if failed
+        """
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (compatible; NewsBot/1.0; +http://example.com/bot)',
+                'Accept': 'application/rss+xml, application/xml, text/xml'
+            }
+            
+            # Make request with SSL verification disabled
+            response = requests.get(
+                feed_url, 
+                headers=headers,
+                verify=False,  # Disable SSL verification
+                timeout=10
+            )
+            response.raise_for_status()
+            
+            # Parse the content with feedparser
+            return feedparser.parse(response.content)
+            
+        except Exception as e:
+            logger.error("Failed to parse feed with requests method", feed_url=feed_url, error=str(e))
+            return None
+    
     async def _save_articles(self, articles: List[Dict[str, Any]]):
         """
         Save articles to the database and update them with their database IDs.
@@ -460,11 +645,27 @@ class ScraperAgent:
         Args:
             articles: List of article dictionaries (modified in-place with IDs)
         """
+        import uuid
+        from app.models.news import NewsJob
+        
         db = SessionLocal()
         try:
+            # Get the actual job UUID from the job_id string
+            job = db.query(NewsJob).filter(NewsJob.job_id == self.job_id).first()
+            if not job:
+                logger.error(f"Job not found in database: {self.job_id}")
+                raise ValueError(f"Job not found: {self.job_id}")
+            
+            job_uuid = job.id  # This is the UUID primary key
+            logger.info(f"Found job UUID: {job_uuid} for job_id: {self.job_id}")
+            
             for i, article_data in enumerate(articles):
+                # Explicitly generate UUID for the article
+                article_id = uuid.uuid4()
+                
                 article = NewsArticle(
-                    job_id=self.job_id,
+                    id=article_id,  # Explicitly set the ID
+                    job_id=job_uuid,  # Use the UUID, not the string
                     title=article_data["title"],
                     url=article_data["url"],
                     content=article_data["content"],

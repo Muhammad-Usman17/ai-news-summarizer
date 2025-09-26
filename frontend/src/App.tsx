@@ -11,15 +11,37 @@ const App: React.FC = () => {
   const [timelineItems, setTimelineItems] = useState<TimelineItem[]>([]);
   const [overallSummary, setOverallSummary] = useState<OverallSummary | null>(null);
   const [loading, setLoading] = useState(false);
+  const [dateLoading, setDateLoading] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
   const [showSettings, setShowSettings] = useState(false);
+  const [hasDataForDate, setHasDataForDate] = useState(false);
 
   // Check backend health on mount
   useEffect(() => {
-    checkHealth();
-    loadNewsData();
-  }, []);
+    const initializeApp = async () => {
+      await checkHealth();
+      await loadNewsData();
+    };
+    initializeApp();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Helper function to safely handle timestamps
+  const safeTimestamp = (timestamp: string | undefined): string => {
+    if (!timestamp) return new Date().toISOString();
+    
+    try {
+      const date = new Date(timestamp);
+      if (isNaN(date.getTime())) {
+        console.warn('Invalid timestamp:', timestamp);
+        return new Date().toISOString();
+      }
+      return timestamp;
+    } catch (error) {
+      console.warn('Error parsing timestamp:', timestamp, error);
+      return new Date().toISOString();
+    }
+  };
 
   const checkHealth = async () => {
     try {
@@ -32,15 +54,16 @@ const App: React.FC = () => {
   };
 
   const loadNewsData = async () => {
+    setDateLoading(true);
     try {
-      // Load news timeline data directly
+      // Load news timeline data for today (default behavior)
       const timelineData = await newsAPI.getNewsTimeline(20);
       
       // Convert to TimelineItem format
       const items: TimelineItem[] = timelineData.items.map((item: any) => ({
         id: item.id,
         type: item.type as 'summary' | 'analysis' | 'article' | 'news_item',
-        timestamp: item.timestamp,
+        timestamp: safeTimestamp(item.timestamp),
         title: item.title,
         content: item.content,
         summary: item.summary,
@@ -52,19 +75,22 @@ const App: React.FC = () => {
         published_at: item.published_at,
         metadata: {
           source: item.source,
-          bullet_points: item.bullet_points,
-          url: item.url
+          key_points: item.bullet_points
         }
       }));
       
       setTimelineItems(items);
+      setHasDataForDate(items.length > 0);
       
       // Set overall summary if available
-      if ((timelineData as any).overall_summary) {
-        setOverallSummary((timelineData as any).overall_summary);
+      if (timelineData.overall_summary) {
+        setOverallSummary(timelineData.overall_summary);
       }
     } catch (error) {
       console.error('Error loading news data:', error);
+      setHasDataForDate(false);
+    } finally {
+      setDateLoading(false);
     }
   };
 
@@ -91,40 +117,64 @@ const App: React.FC = () => {
   };
 
   const handleDateChange = async (date: string) => {
-    setSelectedDate(date);
+    // Convert ISO date to simple date string if needed
+    let dateString = date;
+    if (date.includes('T')) {
+      // If it's an ISO date, extract just the date part
+      dateString = date.split('T')[0];
+    }
+    
+    setSelectedDate(dateString);
+    setDateLoading(true);
+    setHasDataForDate(false);
+    
     try {
-      // Load news for specific date
-      const dailyNews = await newsAPI.getDailyNews(date);
+      // Use timeline API for all date requests - it handles both current and historical data
+      const timelineData = await newsAPI.getNewsTimeline(50, 0, dateString);
       
-      // Convert to TimelineItem format
-      const items: TimelineItem[] = dailyNews.items.map((item: any) => ({
-        id: item.id,
-        type: item.type as 'summary' | 'analysis' | 'article' | 'news_item',
-        timestamp: item.timestamp,
-        title: item.title,
-        content: item.content,
-        summary: item.summary,
-        insights: item.insights,
-        impact_assessment: item.impact_assessment,
-        bullet_points: item.bullet_points,
-        url: item.url,
-        source: item.source,
-        published_at: item.published_at,
-        metadata: {
-          source: item.source,
+      if (timelineData.items && timelineData.items.length > 0) {
+        // Convert to TimelineItem format
+        const items: TimelineItem[] = timelineData.items.map((item: any) => ({
+          id: item.id,
+          type: item.type as 'summary' | 'analysis' | 'article' | 'news_item',
+          timestamp: safeTimestamp(item.timestamp),
+          title: item.title,
+          content: item.content,
+          summary: item.summary,
+          insights: item.insights,
+          impact_assessment: item.impact_assessment,
           bullet_points: item.bullet_points,
-          url: item.url
+          url: item.url,
+          source: item.source,
+          published_at: item.published_at,
+          metadata: {
+            source: item.source,
+            key_points: item.bullet_points
+          }
+        }));
+        
+        setTimelineItems(items);
+        setHasDataForDate(true);
+        
+        // Set overall summary if available
+        if (timelineData.overall_summary) {
+          setOverallSummary(timelineData.overall_summary);
+        } else {
+          setOverallSummary(null);
         }
-      }));
-      
-      setTimelineItems(items);
-      
-      // Set overall summary if available
-      if ((dailyNews as any).overall_summary) {
-        setOverallSummary((dailyNews as any).overall_summary);
+      } else {
+        // No data found for this date
+        setTimelineItems([]);
+        setOverallSummary(null);
+        setHasDataForDate(false);
       }
     } catch (error) {
-      console.error('Error loading news for date:', error);
+      console.error('Error loading news for date:', dateString, error);
+      setTimelineItems([]);
+      setOverallSummary(null);
+      setHasDataForDate(false);
+    } finally {
+      setDateLoading(false);
     }
   };
 
@@ -160,7 +210,7 @@ const App: React.FC = () => {
           onDateChange={handleDateChange}
           onSyncClick={handleSync}
           onSettingsClick={handleSettingsClick}
-          isLoading={loading}
+          isLoading={loading || dateLoading}
         />
 
 
@@ -175,20 +225,69 @@ const App: React.FC = () => {
 
         {/* Timeline */}
         <div className="bg-white rounded-lg shadow-sm p-6">
-          <h2 className="text-lg font-semibold mb-6">News Timeline</h2>
+          <div className="flex items-center justify-between mb-6">
+            <h2 className="text-lg font-semibold">News Timeline</h2>
+            {selectedDate !== new Date().toISOString().split('T')[0] && (
+              <span className="text-sm text-gray-500">
+                Showing data for {new Date(selectedDate).toLocaleDateString('en-US', { 
+                  weekday: 'long',
+                  year: 'numeric',
+                  month: 'long',
+                  day: 'numeric'
+                })}
+              </span>
+            )}
+          </div>
           
-          {timelineItems.length === 0 ? (
+          {dateLoading ? (
             <div className="text-center py-12">
-              <p className="text-gray-500 mb-4">No news items yet</p>
-              <p className="text-sm text-gray-400">
-                Click "Settings" then "Start Traditional Workflow" to generate news summaries
-              </p>
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-4"></div>
+              <p className="text-gray-500">Loading news data...</p>
+            </div>
+          ) : timelineItems.length === 0 ? (
+            <div className="text-center py-12">
+              {selectedDate === new Date().toISOString().split('T')[0] ? (
+                <>
+                  <p className="text-gray-500 mb-4">No news items yet for today</p>
+                  <p className="text-sm text-gray-400">
+                    Click "Settings" then "Start Traditional Workflow" to generate news summaries
+                  </p>
+                </>
+              ) : hasDataForDate ? (
+                <>
+                  <p className="text-gray-500 mb-2">No data found for this date</p>
+                  <p className="text-sm text-gray-400">
+                    Try selecting a different date or running a workflow for this date
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="text-gray-500 mb-2">No processed news available for {new Date(selectedDate).toLocaleDateString()}</p>
+                  <p className="text-sm text-gray-400 mb-4">
+                    This date may not have been processed yet, or no news was available
+                  </p>
+                  <button
+                    onClick={() => setSelectedDate(new Date().toISOString().split('T')[0])}
+                    className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors text-sm"
+                  >
+                    Go to Today
+                  </button>
+                </>
+              )}
             </div>
           ) : (
             <div className="space-y-0">
               {timelineItems.map((item) => (
                 <TimelineItemComponent key={item.id} item={item} />
               ))}
+              
+              {timelineItems.length > 0 && (
+                <div className="text-center py-6 border-t border-gray-100">
+                  <p className="text-sm text-gray-400">
+                    Showing {timelineItems.length} news items
+                  </p>
+                </div>
+              )}
             </div>
           )}
         </div>

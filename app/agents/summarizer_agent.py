@@ -14,6 +14,7 @@ from app.config.database import SessionLocal
 from app.models.news import NewsSummary
 from app.services.redis_stream import RedisStreamService
 from app.services.groq_client import GroqClient
+from app.agents.news_processing_core import NewsProcessingCore
 
 logger = get_logger(__name__)
 settings = get_settings()
@@ -23,7 +24,7 @@ SUMMARIES_GENERATED = Counter('news_summaries_generated_total', 'Total summaries
 
 
 class SummarizerAgent:
-    """Agent responsible for summarizing news articles using Ollama and Autogen."""
+    """Agent responsible for summarizing news articles using Groq."""
     
     def __init__(self, job_id: str):
         self.job_id = job_id
@@ -141,8 +142,12 @@ class SummarizerAgent:
                 
                 processing_time = time.time() - start_time
                 
-                # Use the actual database ID from the article
-                article_id = article.get("id") or article.get("db_id") or (index + 1)
+                # Use the actual database UUID ID from the article
+                article_id = article.get("id") or article.get("db_id")
+                if not article_id:
+                    logger.error("Missing article ID - cannot create summary", 
+                               article_title=article.get("title", "")[:50])
+                    return None
                 
                 # Prepare summary data
                 summary_data = {
@@ -170,7 +175,7 @@ class SummarizerAgent:
     
     async def _summarize_article_fast(self, article: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Fast summarization method using direct Ollama with optimized prompts.
+        Fast summarization method using NewsProcessingCore.
         
         Args:
             article: Article dictionary
@@ -184,8 +189,12 @@ class SummarizerAgent:
         # Truncate content for faster processing (first 2000 chars)
         truncated_content = content[:2000] if content else title
         
-        # Use fast Groq API call for rapid summarization
-        return await self._direct_groq_summarize(title, truncated_content)
+        # Use shared core logic
+        return await NewsProcessingCore.fast_summarize(
+            title=title,
+            content=truncated_content,
+            groq_client=self.groq_client
+        )
     
     async def _summarize_article(self, article: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -194,104 +203,6 @@ class SummarizerAgent:
         """
         return await self._summarize_article_fast(article)
     
-    async def _direct_groq_summarize(self, title: str, content: str) -> Dict[str, Any]:
-        """
-        Fast Groq API summarization for rapid processing.
-        
-        Args:
-            title: Article title
-            content: Article content (already truncated)
-            
-        Returns:
-            Dict containing summary and bullet points
-        """
-        # Optimized prompt for Groq's fast inference
-        prompt = f"""Summarize this tech article quickly:
-
-Title: {title}
-Content: {content}
-
-Respond exactly in this format:
-SUMMARY: [2 clear sentences about the main story]
-KEY POINTS:
-• [key point 1]
-• [key point 2] 
-• [key point 3]"""
-        
-        try:
-            response = await self.groq_client.generate(
-                prompt=prompt,
-                model=self.groq_client.get_fast_model(),  # Use fastest model
-                max_tokens=250,  # Sufficient for structured output
-                temperature=0.1  # Low temperature for consistent format
-            )
-            
-            # Parse the response
-            return self._parse_summary_response(response)
-            
-        except Exception as e:
-            logger.error("Groq summarization failed", error=str(e))
-            
-            # Fast fallback without LLM
-            return {
-                "summary": f"Breaking: {title}",
-                "bullet_points": ["Full article available at source", "AI summary temporarily unavailable", "Check original link for details"]
-            }
-
-
-    
-    def _parse_summary_response(self, response: str) -> Dict[str, Any]:
-        """
-        Parse the LLM response into structured format.
-        
-        Args:
-            response: Raw LLM response
-            
-        Returns:
-            Dict with summary and bullet points
-        """
-        try:
-            lines = response.strip().split('\n')
-            summary = ""
-            bullet_points = []
-            
-            current_section = None
-            
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                
-                if line.upper().startswith('SUMMARY:'):
-                    summary = line[8:].strip()
-                    current_section = "summary"
-                elif line.upper().startswith('KEY POINTS:'):
-                    current_section = "points"
-                elif line.startswith('•') or line.startswith('-') or line.startswith('*'):
-                    bullet_points.append(line[1:].strip())
-                elif current_section == "summary" and not summary:
-                    summary = line
-                elif current_section == "points":
-                    bullet_points.append(line)
-            
-            # Ensure we have content
-            if not summary:
-                summary = "Summary not available"
-            
-            if not bullet_points:
-                bullet_points = ["Key points not available"]
-            
-            return {
-                "summary": summary,
-                "bullet_points": bullet_points
-            }
-            
-        except Exception as e:
-            logger.error("Failed to parse summary response", error=str(e))
-            return {
-                "summary": "Parsing failed",
-                "bullet_points": ["Response parsing error"]
-            }
     
     async def _save_summaries(self, summaries: List[Dict[str, Any]]):
         """
@@ -300,11 +211,23 @@ KEY POINTS:
         Args:
             summaries: List of summary dictionaries
         """
+        import uuid
+        from app.models.news import NewsJob
+        
         db = SessionLocal()
         try:
+            # Get the actual job UUID from the job_id string
+            job = db.query(NewsJob).filter(NewsJob.job_id == self.job_id).first()
+            if not job:
+                logger.error(f"Job not found in database: {self.job_id}")
+                raise ValueError(f"Job not found: {self.job_id}")
+            
+            job_uuid = job.id  # This is the UUID primary key
+            logger.info(f"Found job UUID: {job_uuid} for job_id: {self.job_id}")
+            
             for i, summary_data in enumerate(summaries):
                 summary = NewsSummary(
-                    job_id=self.job_id,
+                    job_id=job_uuid,  # Use the UUID, not the string
                     article_id=summary_data["article_id"],
                     summary=summary_data["summary"],
                     bullet_points=summary_data["bullet_points"],

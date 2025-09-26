@@ -11,7 +11,8 @@ celery_app = Celery(
     include=[
         "app.agents.scraper_agent",
         "app.agents.summarizer_agent", 
-        "app.agents.analyst_agent"
+        "app.agents.analyst_agent",
+        "app.services.scheduler"  # Include scheduler tasks
     ]
 )
 
@@ -27,4 +28,9 @@ celery_app.conf.update(
     task_soft_time_limit=25 * 60,  # 25 minutes
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=100,
+    worker_concurrency=2,  # Handle 2 jobs simultaneously
+    worker_pool='threads',  # Use thread pool for better I/O concurrency
+    # Beat scheduler configuration
+    beat_schedule={},
+    beat_schedule_filename='celerybeat-schedule',
 )

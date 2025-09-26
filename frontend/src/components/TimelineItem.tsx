@@ -34,6 +34,55 @@ const TimelineItemComponent: React.FC<TimelineItemProps> = ({ item }) => {
     }
   };
 
+  // Safe date parsing function
+  const safeParseDate = (dateString: string | undefined): Date | null => {
+    if (!dateString) return null;
+    
+    try {
+      const date = new Date(dateString);
+      if (isNaN(date.getTime())) {
+        console.warn('Invalid date string:', dateString);
+        return null;
+      }
+      return date;
+    } catch (error) {
+      console.warn('Error parsing date:', dateString, error);
+      return null;
+    }
+  };
+
+  // Format relative time safely
+  const formatRelativeTime = (dateString: string | undefined): string => {
+    const date = safeParseDate(dateString);
+    if (!date) return 'Unknown time';
+    
+    try {
+      return formatDistanceToNow(date, { addSuffix: true });
+    } catch (error) {
+      console.warn('Error formatting relative time:', dateString, error);
+      return date.toLocaleDateString();
+    }
+  };
+
+  // Format absolute time safely
+  const formatAbsoluteTime = (dateString: string | undefined): string => {
+    const date = safeParseDate(dateString);
+    if (!date) return 'Unknown date';
+    
+    try {
+      return date.toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'long', 
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+    } catch (error) {
+      console.warn('Error formatting absolute time:', dateString, error);
+      return date.toString();
+    }
+  };
+
   const handleSourceClick = () => {
     if (item.url) {
       window.open(item.url, '_blank', 'noopener,noreferrer');
@@ -86,10 +135,7 @@ const TimelineItemComponent: React.FC<TimelineItemProps> = ({ item }) => {
               <div className="flex items-center space-x-1">
                 <Clock className="w-4 h-4" />
                 <span>
-                  {formatDistanceToNow(
-                    new Date(item.published_at || item.timestamp), 
-                    { addSuffix: true }
-                  )}
+                  {formatRelativeTime(item.published_at || item.timestamp)}
                 </span>
               </div>
             </div>
@@ -158,13 +204,7 @@ const TimelineItemComponent: React.FC<TimelineItemProps> = ({ item }) => {
         {item.published_at && (
           <div className="bg-gray-50 px-6 py-3 border-t">
             <p className="text-xs text-gray-500">
-              Published: {new Date(item.published_at).toLocaleDateString('en-US', {
-                year: 'numeric',
-                month: 'long', 
-                day: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit'
-              })}
+              Published: {formatAbsoluteTime(item.published_at)}
             </p>
           </div>
         )}
